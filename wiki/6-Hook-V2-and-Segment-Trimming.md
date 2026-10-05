@@ -79,8 +79,8 @@ Example:
 | Flag | Behavior | Affected Part |
 |---|---|---|
 | *(default, no flag)* | AI smart-trims boring/filler sections | Main clip only |
-| `--silence-trim` | AI trims aggressively — pauses >0.5s removed | Main clip only |
-| `--no-segment-trim` | No trimming, full start-to-end render | Main clip only |
+| `--silence-trim` | Ask AI for tighter segments; conservative pacing preserves meaningful pauses | Main clip only |
+| `--no-segment-trim` | Disable automatic segment and pause trimming; render full source range | Main clip only |
 
 ### Usage
 

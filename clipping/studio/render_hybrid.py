@@ -54,6 +54,7 @@ broll = _load_studio_internal_module("broll.py", "clipping_studio_broll")
 crop_center_broll = broll.crop_center_broll
 face_detection = _load_studio_internal_module("face_detection.py", "clipping_studio_face_detection")
 get_face_detector = face_detection.get_face_detector
+framing = _load_studio_internal_module("framing.py", "clipping_studio_framing")
 
 def buat_video_hybrid(
     input_video,
@@ -95,6 +96,9 @@ def buat_video_hybrid(
     # 🎛️ PARAMETER TUNING KAMERA
     # =======================================================
     STEP_DETEKSI     = cfg.track_step if cfg.track_step is not None else 0.25   # AI mengecek wajah tiap 0.25 detik
+    if not math.isfinite(STEP_DETEKSI) or STEP_DETEKSI <= 0:
+        STEP_DETEKSI = 0.25
+    STEP_DETEKSI = min(max(STEP_DETEKSI, 0.05), 2.0)
     # STEP_DETEKSI     = 0.5   # AI mengecek wajah tiap 0.5 detik
     # STEP_DETEKSI     = max(0.5, (end_clip - start_clip) / 60.0)   # [OLD] AI mengecek wajah tiap max 0.5 atau sepanjang durasi (end_clip - start_clip) detik per menit
 
@@ -118,16 +122,26 @@ def buat_video_hybrid(
     yolo_model = None
     detector = None
     if cfg.face_detector == "yolo":
-        if not os.path.exists(cfg.file_yolo_model):
-            print(f"   📥 Mendownload YOLOv8 Face Model ({cfg.yolo_size})...")
-            import urllib.request
+        try:
+            if not os.path.exists(cfg.file_yolo_model):
+                print(f"   📥 Mendownload YOLOv8 Face Model ({cfg.yolo_size})...")
+                import urllib.request
 
-            urllib.request.urlretrieve(cfg.url_yolo_model, cfg.file_yolo_model)
-        from ultralytics import YOLO
+                urllib.request.urlretrieve(cfg.url_yolo_model, cfg.file_yolo_model)
+            from ultralytics import YOLO
 
-        yolo_model = YOLO(cfg.file_yolo_model)
+            yolo_model = YOLO(cfg.file_yolo_model)
+        except Exception as exc:
+            print(f"⚠️ {label} - YOLO framing unavailable ({exc}); falling back to MediaPipe.")
+            try:
+                detector = get_face_detector(cfg)
+            except Exception as mp_exc:
+                print(f"⚠️ {label} - Face detection unavailable ({mp_exc}); using safe center crop.")
     else:
-        detector = get_face_detector(cfg)
+        try:
+            detector = get_face_detector(cfg)
+        except Exception as exc:
+            print(f"⚠️ {label} - Face detection unavailable ({exc}); using safe center crop.")
 
     cap = cv2.VideoCapture(input_video)
     orig_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -137,11 +151,10 @@ def buat_video_hybrid(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Dynamic crop dimensions based on target ratio
+    # Use the largest valid source crop with the requested ratio.
     w_part, h_part = RATIO_MAP.get(rasio, (16, 9))
     if _is_vertical_ratio(rasio):
-        crop_w = int(height * w_part / h_part)
-        crop_h = height
+        crop_w, crop_h = framing.calculate_crop_size(width, height, w_part / h_part)
     else:
         crop_w = width
         crop_h = height
@@ -161,9 +174,10 @@ def buat_video_hybrid(
             )
 
     # FASE 1: DETEKSI WAJAH
-    raw_data = []
+    detection_samples = []
     current_time = 0.0
     last_detect_percent = -1
+    detection_warning_logged = False
     
     skip_tracking = getattr(cfg, "static_crop", False) and rasio in ["1:1", "3:4", "4:5"]
 
@@ -179,48 +193,45 @@ def buat_video_hybrid(
             break
 
 
-        face_box = None
-
-        if cfg.face_detector == "yolo":
-            yolo_results = yolo_model(frame, verbose=False)
-            if yolo_results and len(yolo_results[0].boxes) > 0:
-                boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
-                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-                largest_idx = areas.argmax()
-                x1, y1, x2, y2 = boxes[largest_idx]
-                center_x = x1 + (x2 - x1) / 2
-                center_y = y1 + (y2 - y1) / 2
-                face_box = (x1, y1, x2, y2)
-        else:
-            results = detector.detect(
-                mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+        faces = []
+        try:
+            if yolo_model is not None:
+                yolo_results = yolo_model(frame, verbose=False)
+                if yolo_results and len(yolo_results[0].boxes) > 0:
+                    boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+                    scores = yolo_results[0].boxes.conf.cpu().numpy()
+                    faces = [
+                        {"box": tuple(float(value) for value in box), "score": float(score)}
+                        for box, score in zip(boxes, scores)
+                    ]
+            elif detector is not None:
+                results = detector.detect(
+                    mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                    )
                 )
-            )
+                for detection in results.detections or []:
+                    box = detection.bounding_box
+                    categories = getattr(detection, "categories", []) or []
+                    score = float(categories[0].score) if categories else 0.5
+                    faces.append({
+                        "box": (
+                            box.origin_x,
+                            box.origin_y,
+                            box.origin_x + box.width,
+                            box.origin_y + box.height,
+                        ),
+                        "score": score,
+                    })
+        except Exception as exc:
+            if not detection_warning_logged:
+                print(f"⚠️ {label} - Face analysis failed ({exc}); holding/falling back safely.")
+                detection_warning_logged = True
+            yolo_model = None
+            detector = None
 
-            if results.detections:
-                largest_face = max(
-                    results.detections,
-                    key=lambda d: d.bounding_box.width * d.bounding_box.height,
-                ).bounding_box
-                center_x = largest_face.origin_x + (largest_face.width / 2)
-                center_y = largest_face.origin_y + (largest_face.height / 2)
-                face_box = (
-                    largest_face.origin_x,
-                    largest_face.origin_y,
-                    largest_face.origin_x + largest_face.width,
-                    largest_face.origin_y + largest_face.height,
-                )
-
-        raw_data.append(
-            {
-                "time": current_time,
-                "cx": center_x if face_box else default_cx,
-                "cy": center_y if face_box else default_cy,
-                "box": face_box,
-            }
-        )
+        detection_samples.append({"time": current_time, "faces": faces})
 
         detect_percent = (
             min(100, int((current_time / duration) * 100)) if duration > 0 else 100
@@ -231,37 +242,32 @@ def buat_video_hybrid(
 
         current_time += STEP_DETEKSI
 
-    # FASE 2: SMOOTH CAMERA
-    smooth_data = []
-    if raw_data:
-        import statistics as _st
-        initial_cxs = [d["cx"] for d in raw_data[:5]]
-        initial_cys = [d["cy"] for d in raw_data[:5]]
-        cam_cx = _st.median(initial_cxs) if initial_cxs else raw_data[0]["cx"]
-        cam_cy = _st.median(initial_cys) if initial_cys else raw_data[0]["cy"]
-        
-        deadzone_px = crop_w * DEADZONE_RATIO
-        
-        # Consistent aggressive snapping for wide-to-tight camera cuts in standard clips
-        temp_snap = SNAP_THRESHOLD if SNAP_THRESHOLD < 0.1 else 0.08
-        snap_px = width * temp_snap
-
-        for d in raw_data:
-            face_cx = d["cx"]
-            face_cy = d["cy"]
-
-            if abs(face_cx - cam_cx) > snap_px:
-                cam_cx = face_cx
-            else:
-                if face_cx > cam_cx + deadzone_px:
-                    cam_cx += (face_cx - (cam_cx + deadzone_px)) * SMOOTH_FACTOR
-                elif face_cx < cam_cx - deadzone_px:
-                    cam_cx += (face_cx - (cam_cx - deadzone_px)) * SMOOTH_FACTOR
-
-            # Vertical smoothing
-            cam_cy += (face_cy - cam_cy) * SMOOTH_FACTOR
-
-            smooth_data.append({"time": d["time"], "cx": cam_cx, "cy": cam_cy})
+    track_data, track_stats = framing.select_stable_face_track(
+        detection_samples,
+        frame_width=width,
+        frame_height=height,
+        crop_width=crop_w,
+        min_confidence=getattr(cfg, "track_conf", 0.55),
+        sample_step=STEP_DETEKSI,
+        association_ratio=SNAP_THRESHOLD,
+    )
+    smooth_data = framing.smooth_camera_track(
+        track_data,
+        frame_width=width,
+        frame_height=height,
+        crop_width=crop_w,
+        crop_height=crop_h,
+        deadzone_ratio=DEADZONE_RATIO,
+        smooth_factor=SMOOTH_FACTOR,
+    )
+    raw_data = track_data
+    if track_stats["max_faces"] or track_stats["fallback_samples"]:
+        print(
+            f"[Framing] max faces={track_stats['max_faces']}, "
+            f"target changes={track_stats['target_changes']}, "
+            f"held={track_stats['held_samples']} samples, "
+            f"center fallback={track_stats['fallback_samples']} samples."
+        )
 
     def get_x(t):
         if not smooth_data:
@@ -360,8 +366,9 @@ def buat_video_hybrid(
             if _is_vertical_ratio(rasio):
                 # Vertical/square ratios: face-tracked crop
                 cx_base, cy_base = _get_pos(t)
-                x1_crop = int(max(0, min(cx_base - crop_w // 2, width - crop_w)))
-                y1_crop = int(max(0, min(cy_base - crop_h // 2, height - crop_h)))
+                x1_crop, y1_crop = framing.clamp_crop_origin(
+                    cx_base, cy_base, crop_w, crop_h, width, height
+                )
                 cropped = frame_utama[y1_crop : y1_crop + crop_h, x1_crop : x1_crop + crop_w]
                 frame_normal = _resize_frame(cropped, (base_out_w, base_out_h))
             else:

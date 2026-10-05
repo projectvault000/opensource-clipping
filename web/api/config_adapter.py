@@ -113,6 +113,7 @@ def build_config_from_payload(
         # Paths
         base_dir=base_dir,
         outputs_dir=outputs_dir,
+        job_id=job_id,
         font_dir=font_dir,
         file_video_asli=file_video_asli,
         file_font_thumbnail=os.path.abspath(

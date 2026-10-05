@@ -21,6 +21,45 @@
 
 ---
 
+## V1 Release status
+
+This repository is the V1 release branch for a Google Colab clipping workflow. The release gate is a fresh Colab GPU session, using `notebooks/Quick_Start.ipynb` from clone through approved ZIP download. Checkpoints in `/content` can help after a process interruption while the runtime remains alive; they do not survive a full runtime reset unless state has been copied to persistent storage.
+
+Current release audit: **NOT READY FOR V1.0.0**. See [V1 Colab Audit](docs/V1_COLAB_AUDIT.md) for the tested paths and remaining gates.
+
+### Recommended beginner flow
+
+```bash
+# Clone and install
+git clone https://github.com/projectvault000/opensource-clipping.git
+cd opensource-clipping
+pip install -r requirements.txt
+
+# Configure secrets
+cp .env.sample .env
+# then add your GOOGLE_API_KEY (and PEXELS_API_KEY if you want B-roll)
+
+# Run the production-style preset
+VIDEO_URL="PASTE_YOUR_YOUTUBE_LINK_HERE"
+python main.py \
+  --url "$VIDEO_URL" \
+  --clips 5 \
+  --ratio "9:16" \
+  --font-style "HORMOZI" \
+  --voiceover \
+  --voiceover-style reaction \
+  --voiceover-length normal \
+  --voiceover-voice "en-US-AvaNeural" \
+  --hook-duration 3 \
+  --words-per-sub 5 \
+  --whisper-compute-type float16 \
+  --no-bgm
+```
+
+Use `python main.py --help` for the authoritative CLI reference.
+
+---
+
 🟢 **Actively Maintained**: contributions, bug reports, and feature PRs are welcome.
 
 ---
@@ -63,54 +102,9 @@
 
 ## ☁️ Running on Google Colab (Recommended)
 
-If you don't have a local GPU, the easiest way to run this pipeline is via **Google Colab**.
-Open a new Google Colab notebook, set the Runtime to **T4 GPU**, and create the following cells:
+Open the [Quick Start Notebook](notebooks/Quick_Start.ipynb) in Google Colab and select **Runtime > Change runtime type > GPU**. Follow its cells to clone the repository, install `requirements.txt`, load Colab Secrets, render, inspect, review, approve, and download the approved ZIP. No particular GPU model is required by the notebook. It checks CUDA availability before a `float16` Whisper run and explains the CPU `float32` option.
 
-**Cell 1: Setup & Clone**
-```python
-!rm -rf ./* ./.*
-!git clone https://github.com/your-username/opensource-clipping.git .
-!pip install -r requirements.txt
-```
-
-**Cell 2: Setup API Keys**
-```python
-import os
-from pathlib import Path
-from google.colab import userdata
-
-# Store your keys in Colab Secrets first!
-GOOGLE_API_KEY = userdata.get("GOOGLE_API_KEY")
-
-env_text = f"GOOGLE_API_KEY={GOOGLE_API_KEY}\n"
-Path(".env").write_text(env_text, encoding="utf-8")
-```
-
-**Cell 3: Execute (Example including Kaggle fallback for float32)**
-```python
-URL_YOUTUBE = "https://www.youtube.com/watch?v=Dc4_aBFAYWE&pp=0gcJCdkKAYcqIYzv"
-JUMLAH_CLIP = 10
-RASIO = "9:16"
-FONT_STYLE = "DEFAULT"
-GEMINI_MODEL = "gemini-3-flash-preview"
-# Use 'float32' for Kaggle CPU/T4 limitations, or 'float16' for standard Colab T4 GPUs
-WHISPER_COMPUTE_TYPE = "float32"
-
-!python main.py \
-  --url "{URL_YOUTUBE}" \
-  --clips {JUMLAH_CLIP} \
-  --ratio "{RASIO}" \
-  --font-style "{FONT_STYLE}" \
-  --hook-duration 3 \
-  --words-per-sub 5 \
-  --gemini-model "{GEMINI_MODEL}" \
-  --whisper-compute-type "{WHISPER_COMPUTE_TYPE}" \
-  --no-bgm
-```
-
-> 💡 **New to this project?** Use the **[Quick Start Notebook](notebooks/Quick_Start.ipynb)** — a beginner-friendly notebook with minimal configuration, step-by-step English instructions, and only 3 settings to change (YouTube URL, total clips, and Whisper model).
->
-> We also include `notebooks/Lib_OpenSource_Clipping.ipynb` as a full-featured template.
+The notebook keeps rendering in fast, temporary `/content` storage. Optional Drive mounting copies a finished approved ZIP; it does not provide automatic checkpoint recovery after a full runtime reset. `notebooks/Lib_OpenSource_Clipping.ipynb` is a legacy template, not the V1 release path.
 
 ---
 
@@ -152,7 +146,7 @@ The **Clipping Studio** is a browser-based dashboard hosted for free on **GitHub
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-username/opensource-clipping.git
+git clone https://github.com/projectvault000/opensource-clipping.git
 cd opensource-clipping
 
 # 2. Install dependencies (pick one)
@@ -509,8 +503,8 @@ Example:
 | Flag | Behavior | Affected Part |
 |---|---|---|
 | *(default, no flag)* | AI smart-trims boring/filler sections | Main clip only |
-| `--silence-trim` | AI trims more aggressively — pauses >0.5s removed | Main clip only |
-| `--no-segment-trim` | No trimming, full start-to-end render | Main clip only |
+| `--silence-trim` | Ask AI for tighter segments; conservative pacing preserves meaningful pauses | Main clip only |
+| `--no-segment-trim` | Disable automatic segment and pause trimming; render full source range | Main clip only |
 
 > [!NOTE]
 > - **Hook V2 is not affected** by any of the above flags. Hook V2 always picks its rapid-fire clips as chosen by AI.

@@ -11,6 +11,10 @@ import time
 
 from yt_dlp import YoutubeDL
 from faster_whisper import WhisperModel
+try:
+    from .subtitle_policy import group_timed_words
+except ImportError:
+    from clipping.subtitle_policy import group_timed_words
 
 
 # ==============================================================================
@@ -329,27 +333,10 @@ def parse_youtube_json3_subs(json_path: str, max_words_per_subtitle: int = 5) ->
             if flat_words[i]["end"] > flat_words[i + 1]["start"]:
                 flat_words[i]["end"] = max(flat_words[i]["start"] + 0.1, flat_words[i + 1]["start"])
 
-        # Group them into segments
-        chunk_words = []
-        chunk_start = 0.0
-
-        for i, w in enumerate(flat_words):
-            if len(chunk_words) == 0:
-                chunk_start = w["start"]
-
-            chunk_words.append(w)
-
-            if len(chunk_words) == max_words_per_subtitle or i == len(flat_words) - 1:
-                chunk_text = " ".join([cw["word"] for cw in chunk_words])
-                chunk_end = w["end"]
-                transkrip_lengkap += f"[{chunk_start:.1f} - {chunk_end:.1f}] {chunk_text}\n"
-
-                data_segmen.append({
-                    "start": chunk_start,
-                    "end": chunk_end,
-                    "words": chunk_words,
-                })
-                chunk_words = []
+        grouped_words = group_timed_words(flat_words, max_words=max_words_per_subtitle)
+        for phrase in grouped_words:
+            transkrip_lengkap += f"[{phrase['start']:.1f} - {phrase['end']:.1f}] {phrase['text']}\n"
+            data_segmen.append(phrase)
 
         return transkrip_lengkap, data_segmen
 
@@ -427,26 +414,13 @@ def transcribe_video(
         transkrip_lengkap += f"[{segment.start:.1f} - {segment.end:.1f}] {segment.text}\n"
 
         if segment.words:
-            chunk_words: list[dict] = []
-            chunk_start = 0.0
-
-            for i, w in enumerate(segment.words):
-                if len(chunk_words) == 0:
-                    chunk_start = w.start
-
-                chunk_words.append({
-                    "word": w.word.strip(),
-                    "start": w.start,
-                    "end": w.end,
-                })
-
-                if len(chunk_words) == max_words_per_subtitle or i == len(segment.words) - 1:
-                    data_segmen.append({
-                        "start": chunk_start,
-                        "end": w.end,
-                        "words": chunk_words,
-                    })
-                    chunk_words = []
+            words = [
+                {"word": w.word.strip(), "start": w.start, "end": w.end}
+                for w in segment.words
+            ]
+            data_segmen.extend(
+                group_timed_words(words, max_words=max_words_per_subtitle)
+            )
 
     progress.update(total_dur - progress.n)  # snap ke 100% saat selesai
     progress.close()
@@ -619,11 +593,13 @@ HOOK V2 (MULTI-HOOK INTRO — WAJIB):
     if cfg and not getattr(cfg, "no_segment_trim", False):
         _silence_hint = ""
         if cfg and getattr(cfg, "silence_trim", False):
-            _silence_hint = "\n- AGRESIF buang bagian diam/silence/dead air. Jangan sertakan jeda lebih dari 0.5 detik."
+            _silence_hint = "\n- Pilih bagian yang lebih rapat dengan membuang hanya dead air yang jelas tidak bermakna. Jangan menghapus jeda hanya karena durasinya lebih dari 0.5 detik; pertahankan hesitation, napas, dan jeda emosional/dramatis. Pacing lokal akan memendekkan jeda panjang secara konservatif."
         _segment_prompt = f"""
 
 SEGMENT-BASED TRIMMING (KEEP SEGMENTS — WAJIB):
 - Untuk setiap klip, analisis apakah ada bagian yang kurang menarik, terlalu diam, bertele-tele, atau filler di tengah.
+- Jangan membuang pause secara terpisah jika ujaran di sekitarnya tetap penting; pause dapat menyampaikan hesitation atau emosi.
+- Pacing lokal menangani jeda panjang dari timestamp kata. Jangan membuat micro-cut berulang atau memotong napas/jeda natural.
 - Jika ada, pecah klip menjadi beberapa "keep_segments" — hanya potongan terbaik yang dipertahankan.
 - Setiap segment berisi: start_time dan end_time.
 - Segment harus berurutan secara kronologis dan tidak boleh overlap.
@@ -645,7 +621,19 @@ TUGAS UTAMA:
 ATURAN PEMILIHAN KLIP & VIRAL-BILITY:
 - Durasi klip harus {MIN_CLIP_DURATION}-{MAX_CLIP_DURATION} detik.
 - Pilih bagian yang punya emosi, konflik, kejutan, insight, opini kuat, pelajaran praktis, atau punchline jelas.
-- Evaluasi kekuatan viral (viral-bility) dan berikan "viral_score" (1-100) yang merepresentasikan seberapa viral suatu klip.
+- Pilih complete interesting moments, bukan kalimat menarik yang kehilangan konteks.
+- Untuk setiap kandidat, identifikasi core moment terlebih dahulu, lalu pilih source range yang memberi cukup konteks sebelum dan sesudahnya.
+- Pertimbangkan setup → development → payoff, question → explanation → answer, claim → challenge → response, problem → decision → consequence, concept → example → takeaway, atau setup → punchline bila sesuai dengan source.
+- Jangan memaksakan struktur yang tidak ada. Penjelasan edukatif yang selesai dengan takeaway, atau lelucon yang selesai dengan punchline, valid tanpa drama buatan.
+- Pastikan penonton tahu siapa/apa yang dibahas; sertakan pertanyaan, setup, definisi, atau referen pronoun yang memang diperlukan.
+- Jangan mulai di tengah kalimat, kata, jawaban, atau referen yang belum jelas. Jangan berakhir tepat sebelum jawaban, reaksi, hasil, punchline, atau konsekuensi yang tersedia di source.
+- Batas harus mengikuti timestamp transcript dan natural speech boundary. Jangan mengubah urutan atau kata-kata sumber.
+- Sertakan hanya konteks yang membantu memahami atau menghargai core moment; buang setup yang tidak perlu.
+- Source quality tetap prioritas. Jangan pilih momen lemah hanya karena bisa ditimpa commentary atau diberi hook.
+- Hook dan commentary opportunity adalah nilai tambah, bukan alasan utama memilih kandidat.
+- Pilih momen yang berbeda untuk memenuhi jumlah clip; hindari rentang overlap berlebihan dan cerita yang mengulang poin yang sama.
+- Pertahankan "viral_score" (1-100) untuk kompatibilitas; ranking harus mempertimbangkan source strength, clarity, story completeness, payoff, context efficiency, natural boundaries, serta hook/commentary opportunity, bukan hanya kalimat paling mengejutkan.
+- Evaluasi kekuatan viral (viral-bility) dan berikan "viral_score" (1-100) yang merepresentasikan seberapa kuat kandidat sebagai Short secara keseluruhan.
   - 90-100: Sangat berpotensi fyp/viral, emosi/konflik kuat, hook sangat nendang.
   - 80-89: Menarik, berpotensi performa baik.
   - 70-79: Standar, informatif tapi mungkin kurang greget.
@@ -654,11 +642,12 @@ ATURAN PEMILIHAN KLIP & VIRAL-BILITY:
 - Jangan pilih klip yang terasa datar, bertele-tele, atau tidak punya payoff yang jelas.
 
 ATURAN RETENTION & STRUKTUR KLIP:
-- Pastikan 3 detik pertama klip punya daya tarik kuat: hook, konflik, rasa penasaran, statement tajam, emosi, atau pertanyaan implisit.
-- Klip ideal memiliki struktur:
-  hook -> context singkat -> tension/insight -> payoff.
-- Jangan memilih klip yang baru menarik setelah terlalu lama berjalan.
-- Jika bagian awal segmen terlalu lambat, geser start_time ke kalimat yang lebih kuat.
+- Identifikasi core_start_time dan core_end_time sebagai waktu absolut untuk bagian inti yang paling menarik; keduanya harus berada di dalam source range.
+- start_time/end_time adalah keseluruhan source range yang dibutuhkan penonton untuk memahami core moment dan menyaksikan resolusi yang tersedia.
+- Isi story_structure.setup, development, dan payoff dengan true hanya jika unsur tersebut benar-benar ada di source; jangan mengarang payoff.
+- Pastikan 3 detik pertama source range cukup jelas untuk membuat penonton memahami konteks atau tertarik secara relevan.
+- Jangan memilih klip yang baru menarik setelah terlalu lama berjalan jika setup dapat dipangkas tanpa menghilangkan pemahaman.
+- Jika awal kandidat terlalu lambat, pindahkan start_time ke batas kalimat natural yang tetap menyertakan konteks esensial.
 - Jika payoff sudah selesai, jangan memperpanjang klip tanpa alasan.
 - Jangan memasukkan intro, basa-basi, jeda panjang, atau transisi yang tidak menambah daya tarik.
 - Utamakan klip yang membuat penonton ingin:
@@ -670,8 +659,9 @@ ATURAN RETENTION & STRUKTUR KLIP:
   6. atau merasa "ini gue banget".
 
 ATURAN PEMOTONGAN TIMING:
-- start_time harus dimulai sedekat mungkin dengan momen kuat pertama, bukan sekadar awal topik.
-- end_time harus berhenti setelah payoff, kesimpulan, punchline, atau emotional beat utama selesai.
+- start_time harus dimulai pada batas ujaran yang natural dan cukup awal untuk membuat topik/referen dapat dipahami; jangan otomatis menyamakannya dengan awal core moment.
+- end_time harus berhenti setelah payoff/resolusi yang benar-benar tersedia, kesimpulan, punchline, jawaban, reaksi, atau consequence selesai.
+- Jika pertanyaan termasuk dalam kandidat, sertakan jawaban yang cukup; jangan berhenti pada kalimat menggantung sebelum jawaban.
 - Jangan potong terlalu awal jika kalimat masih menggantung.
 - Jangan lanjutkan klip terlalu lama setelah inti pesan selesai.
 - Klip harus tetap bisa dipahami tanpa harus menonton bagian sebelum atau sesudahnya.
@@ -704,13 +694,17 @@ ATURAN KHUSUS KLASIFIKASI:
 3. Owner story dibagi berdasarkan angle. (Perjuangan brand -> Business. Kehidupan pribadi/keluarga -> Life. Rezeki/ibadah -> Muslim).
 
 HOOK (WAJIB):
-- Ambil 1 kalimat paling punchy yang ADA DI DALAM klip.
-- Hook harus terasa kuat dan menarik perhatian dalam ~{durasi_hook} detik pertama.
-- Simpan sebagai hook_start_time dan hook_end_time.
-- Hook harus membuat orang ingin lanjut menonton, tapi jangan clickbait palsu.
-- Pastikan hook masih natural dan benar-benar diucapkan dalam transkrip.
-- Jika hook terbaik tidak berada tepat di awal kandidat klip, sesuaikan start_time agar hook muncul sedini mungkin.
-- Hook harus cocok sebagai teks pembuka on-screen untuk menahan penonton dalam 3 detik pertama.
+- Gunakan seluruh transkrip untuk memahami pembukaan, perkembangan, dan payoff klip sebelum memilih hook.
+- Pilih strategi yang paling kuat dan jujur: source_teaser (default), commentary_hook, text_hook, atau question_hook.
+- Source teaser harus berupa cuplikan audio/video asli dari dalam rentang klip; jangan menulis ulang dialog seolah-olah diucapkan narasumber.
+- commentary_hook hanya jika voice-over aktif: satu kalimat pendek, spesifik, didukung transkrip, tanpa klaim yang tidak tersedia.
+- text_hook/question_hook harus singkat (idealnya 3-8 kata untuk text_hook), relevan, dan benar-benar dijawab oleh klip.
+- Jangan mengungkapkan inti payoff/reveal lebih awal. Jangan memakai hype generik seperti "you won't believe", "this changes everything", atau "wait until you see".
+- Utamakan source teaser atau mulai langsung dari sumber jika tidak ada framing yang benar-benar lebih baik.
+- Hook harus berada di dalam rentang klip terpilih, berurutan, dan mengambil batas kalimat natural. Targetkan ~{durasi_hook} detik; sedikit lebih lama boleh jika memotongnya akan memutus kalimat.
+- Isi hook_plan dengan type, duration_target, text, source_start, dan source_end. source_start/source_end adalah waktu absolut dari video sumber. text kosong hanya untuk source_teaser.
+- Tetap isi hook_start_time dan hook_end_time untuk kompatibilitas lama dengan rentang source_teaser yang sama.
+- Jika --hook-duration bernilai 0, pilih source_teaser dengan duration_target 0; renderer akan menonaktifkan Hook V1.
 
 TYPOGRAPHY PLAN (KINETIC TYPOGRAPHY):
 - Pilih 3-6 kata TUNGGAL paling berbobot, emosional, atau paling layak ditekankan dari setiap klip.
@@ -726,16 +720,19 @@ TYPOGRAPHY PLAN (KINETIC TYPOGRAPHY):
 - Prioritaskan kata yang paling kuat secara emosi, makna, atau retensi visual.
 
 B-ROLL (WAJIB JIKA RELEVAN):
-- Carikan maksimal 1-3 momen dalam klip yang sangat cocok disisipi video B-roll / stock footage.
+- B-roll adalah pilihan terakhir setelah source asli, replay, atau zoom; gunakan hanya jika footage stock menambah pemahaman visual yang konkret.
+- Carikan maksimal 1-3 momen dalam klip yang benar-benar terbantu oleh video B-roll / stock footage.
 - Setiap B-roll berdurasi 3-7 detik.
 - Berikan:
   - start_time
   - end_time
   - search_query
-- search_query harus singkat, jelas, dan dalam Bahasa Inggris.
+- visual_intent: satu frasa singkat yang menjelaskan konsep visual yang diilustrasikan, bukan klaim bahwa footage stock adalah kejadian/orang/perusahaan asli.
+- search_query harus konkret, searchable, 3-8 kata Bahasa Inggris; hindari kata generik tunggal seperti business, money, technology, success, atau failure.
+- Jangan pilih stock yang menyiratkan fakta baru (misalnya layoffs untuk "cut costs") atau menggambarkan orang/brand/kejadian spesifik seolah-olah itu footage autentik.
 - Jangan taruh B-roll tepat di detik yang sama dengan hook.
-- Hanya tambahkan B-roll jika benar-benar membantu visualisasi isi ucapan.
-- Jika tidak ada momen yang cocok, isi broll_list dengan array kosong [].
+- Jangan menutup reaksi speaker atau payoff sumber dengan stock footage.
+- Jika source, replay, atau zoom sudah lebih baik, atau tidak ada query yang konkret dan tidak menyesatkan, isi broll_list dengan array kosong [].
 
 VISUAL B-ROLL HOOK (0-3 DETIK PERTAMA):
 - Berikan 2-5 ide B-Roll pembuka yang kontras, lucu, dramatis, atau memancing rasa penasaran sebelum video asli masuk.
@@ -753,7 +750,8 @@ SLOW CLOSING:
 
 ALASAN PEMILIHAN:
 - Isi field 'alasan' dengan penjelasan singkat mengapa klip ini layak dipilih.
-- Fokus pada nilai emosi, kekuatan hook, potensi retention, shareability, dan payoff.
+- Jelaskan core moment dan mengapa setup/konteks serta ending yang dipilih cukup untuk membuatnya dipahami.
+- Fokus pada nilai sumber, kejelasan, progression, payoff/resolusi, context efficiency, dan baru kemudian retention/shareability.
 - Jelaskan trigger viral utama dari klip ini.
 - Jelaskan kenapa orang kemungkinan akan menonton sampai akhir.
 - Jelaskan kenapa klip ini tetap menarik walau ditonton tanpa konteks video penuh.
@@ -877,11 +875,21 @@ STRUKTUR JSON WAJIB (Ikuti nama field ini secara kaku):
     "viral_score": 95,
     "start_time": 30.5,
     "end_time": 90.0,
+    "core_start_time": 41.2,
+    "core_end_time": 53.8,
+    "story_structure": {{"setup": true, "development": true, "payoff": true}},
     "hook_start_time": 30.5,
     "hook_end_time": 35.0,
+        "hook_plan": {{
+            "type": "source_teaser",
+            "duration_target": {float(durasi_hook):.1f},
+            "text": "",
+            "source_start": 30.5,
+            "source_end": 35.0
+        }},
     "bgm_mood": "mood_here",
     "typography_plan": [{{ "kata_utama": "...", "scale_level": 2, "style": "utama", "animasi": "bounce_pop" }}],
-    "broll_list": [{{ "start_time": 40.0, "end_time": 45.0, "search_query": "..." }}],
+    "broll_list": [{{ "start_time": 40.0, "end_time": 45.0, "search_query": "semiconductor clean room manufacturing", "visual_intent": "Illustrate a controlled chip manufacturing environment" }}],
     "recommended_visual_broll_hook": [
       {{ "broll_idea": "...", "search_keyword": "...", "why_it_works": "..." }}
     ],
@@ -953,8 +961,32 @@ def analyze_with_nvidia(transkrip_lengkap: str, cfg) -> list[dict]:
                 "viral_score": {"type": "integer"},
                 "start_time": {"type": "number"},
                 "end_time": {"type": "number"},
+                "core_start_time": {"type": "number"},
+                "core_end_time": {"type": "number"},
+                "story_structure": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "setup": {"type": "boolean"},
+                        "development": {"type": "boolean"},
+                        "payoff": {"type": "boolean"},
+                    },
+                    "required": ["setup", "development", "payoff"],
+                },
                 "hook_start_time": {"type": "number"},
                 "hook_end_time": {"type": "number"},
+                "hook_plan": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {"type": "string", "enum": ["source_teaser", "commentary_hook", "text_hook", "question_hook"]},
+                        "duration_target": {"type": "number"},
+                        "text": {"type": "string"},
+                        "source_start": {"type": "number"},
+                        "source_end": {"type": "number"},
+                    },
+                    "required": ["type", "duration_target", "text", "source_start", "source_end"],
+                },
                 "bgm_mood": {
                     "type": "string",
                     "enum": ["chill", "epic", "sad", "upbeat", "suspense"]
@@ -981,9 +1013,10 @@ def analyze_with_nvidia(transkrip_lengkap: str, cfg) -> list[dict]:
                         "properties": {
                             "start_time": {"type": "number"},
                             "end_time": {"type": "number"},
-                            "search_query": {"type": "string"}
+                            "search_query": {"type": "string"},
+                            "visual_intent": {"type": "string"}
                         },
-                        "required": ["start_time", "end_time", "search_query"]
+                        "required": ["start_time", "end_time", "search_query", "visual_intent"]
                     }
                 },
                 "recommended_visual_broll_hook": {
@@ -1082,7 +1115,8 @@ def analyze_with_nvidia(transkrip_lengkap: str, cfg) -> list[dict]:
                 },
             },
             "required": [
-                "rank", "viral_score", "start_time", "end_time", "hook_start_time", "hook_end_time",
+                "rank", "viral_score", "start_time", "end_time", "core_start_time", "core_end_time", "story_structure",
+                "hook_start_time", "hook_end_time", "hook_plan",
                 "bgm_mood", "typography_plan", "broll_list", "recommended_visual_broll_hook", "title_indonesia",
                 "title_inggris", "hastag", "description_hook", "description_context",
                 "keyword_tags", "tiktok_title_id", "tiktok_caption_id", "tiktok_caption",
@@ -1169,8 +1203,9 @@ def analyze_with_gemini(
                 "start_time": {"type": "NUMBER"},
                 "end_time": {"type": "NUMBER"},
                 "search_query": {"type": "STRING"},
+                "visual_intent": {"type": "STRING"},
             },
-            "required": ["start_time", "end_time", "search_query"],
+            "required": ["start_time", "end_time", "search_query", "visual_intent"],
         },
     }
 
@@ -1246,8 +1281,30 @@ def analyze_with_gemini(
                     "viral_score": {"type": "INTEGER"},
                     "hook_start_time": {"type": "NUMBER"},
                     "hook_end_time": {"type": "NUMBER"},
+                    "hook_plan": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "type": {"type": "STRING", "enum": ["source_teaser", "commentary_hook", "text_hook", "question_hook"]},
+                            "duration_target": {"type": "NUMBER"},
+                            "text": {"type": "STRING"},
+                            "source_start": {"type": "NUMBER"},
+                            "source_end": {"type": "NUMBER"},
+                        },
+                        "required": ["type", "duration_target", "text", "source_start", "source_end"],
+                    },
                     "start_time": {"type": "NUMBER"},
                     "end_time": {"type": "NUMBER"},
+                    "core_start_time": {"type": "NUMBER"},
+                    "core_end_time": {"type": "NUMBER"},
+                    "story_structure": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "setup": {"type": "BOOLEAN"},
+                            "development": {"type": "BOOLEAN"},
+                            "payoff": {"type": "BOOLEAN"},
+                        },
+                        "required": ["setup", "development", "payoff"],
+                    },
                     "typography_plan": schema_typography,
                     "broll_list": schema_broll,
                     "recommended_visual_broll_hook": schema_visual_broll_hook,
@@ -1305,8 +1362,8 @@ def analyze_with_gemini(
                     },
                 },
                 "required": [
-                    "rank", "viral_score", "hook_start_time", "hook_end_time",
-                    "start_time", "end_time", "typography_plan",
+                    "rank", "viral_score", "hook_start_time", "hook_end_time", "hook_plan",
+                    "start_time", "end_time", "core_start_time", "core_end_time", "story_structure", "typography_plan",
                     "broll_list", "recommended_visual_broll_hook", "alasan", "bgm_mood",
                     "title_indonesia", "title_inggris", "hastag",
                     "description_hook", "description_context",

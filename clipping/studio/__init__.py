@@ -1,8 +1,10 @@
 """
 clipping.studio — Video Rendering Engine
 
-Thin compatibility entry point for the Studio pipeline.
-Public API is re-exported from internal modules under clipping/studio/.
+Compatibility package for the Studio pipeline.
+This package exposes the same API surface as the legacy module wrapper and
+ensures that submodules such as clipping.studio.core can be imported as a real
+package instead of being shadowed by the legacy clipping/studio.py module.
 """
 
 import importlib.util
@@ -24,7 +26,7 @@ def _load_studio_internal_module(file_name: str, module_alias: str):
     Returns:
         Loaded Python module object.
     """
-    module_path = os.path.join(os.path.dirname(__file__), "studio", file_name)
+    module_path = os.path.join(os.path.dirname(__file__), file_name)
     spec = importlib.util.spec_from_file_location(module_alias, module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Gagal memuat modul internal: {module_path}")
@@ -70,3 +72,38 @@ buat_video_camera_switch = _core.buat_video_camera_switch
 _get_render_dims = _core._get_render_dims
 _is_vertical_ratio = _core._is_vertical_ratio
 proses_klip = _core.proses_klip
+
+__all__ = [
+    "FIREFOX_UA",
+    "format_seconds",
+    "escape_ffmpeg_filter_value",
+    "detect_video_encoder",
+    "get_ts_encode_args",
+    "get_mp4_encode_args",
+    "open_ffmpeg_video_writer",
+    "build_ffmpeg_progress_cmd",
+    "run_ffmpeg_with_progress",
+    "get_face_detector",
+    "estimate_speaker_count_from_video",
+    "download_google_font",
+    "register_fonts_for_libass",
+    "siapkan_font_tipografi",
+    "get_local_bgm_file",
+    "build_bgm_filter",
+    "download_pexels_broll",
+    "crop_center_broll",
+    "buat_video_hybrid",
+    "buat_file_ass",
+    "siapkan_glitch_video",
+    "download_transition_raw",
+    "download_all_transitions",
+    "get_random_transition",
+    "prepare_transition_clip",
+    "TMP_TRANSITION_POOL",
+    "buat_thumbnail",
+    "buat_video_split_screen",
+    "buat_video_camera_switch",
+    "_get_render_dims",
+    "_is_vertical_ratio",
+    "proses_klip",
+]

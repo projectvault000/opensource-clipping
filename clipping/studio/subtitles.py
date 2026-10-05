@@ -21,6 +21,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageDraw, ImageFont
 from yt_dlp import YoutubeDL
+from clipping.subtitle_policy import escape_ass_text
 
 def _load_studio_internal_module(file_name: str, module_alias: str):
     module_path = os.path.join(os.path.dirname(__file__), file_name)
@@ -185,16 +186,16 @@ def buat_file_ass(
                             if pakai_karaoke:
                                 if j == i:
                                     text_parts.append(
-                                        f"{{\\c&H00FFFF&}}{x['word']}{{\\c&HFFFFFF&}}"
+                                        f"{{\\c&H00FFFF&}}{escape_ass_text(x['word'])}{{\\c&HFFFFFF&}}"
                                     )
                                 else:
-                                    text_parts.append(x["word"])
+                                    text_parts.append(escape_ass_text(x["word"]))
                             else:
                                 if j <= i:
-                                    text_parts.append(x["word"])
+                                    text_parts.append(escape_ass_text(x["word"]))
                                 else:
                                     text_parts.append(
-                                        f"{{\\alpha&HFF&}}{x['word']}{{\\alpha&H00&}}"
+                                        f"{{\\alpha&HFF&}}{escape_ass_text(x['word'])}{{\\alpha&H00&}}"
                                     )
 
                         f.write(
@@ -287,7 +288,7 @@ def buat_file_ass(
                 x_offset = current_w if not current_line else current_w + space_width
                 current_line.append(
                     {
-                        "text": w_dict["word"],
+                        "text": escape_ass_text(w_dict["word"]),
                         "plan": plan,
                         "w": w_len,
                         "h": h_len,

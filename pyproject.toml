@@ -1,13 +1,15 @@
 [project]
 name = "opensource-clipping"
-version = "1.12.0"
-description = "AI Auto-Clipper & Teaser Generator — converts long videos into viral short-form clips"
+version = "1.15.0"
+description = "AI Auto-Clipper & Teaser Generator — converts long videos into reusable short-form clips with review and resume support"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "yt-dlp[default]",
     "faster-whisper",
     "google-genai",
+    "numpy<2.0.0; python_version < '3.13'",
+    "numpy>=2.0.0; python_version >= '3.13'",
     "mediapipe",
     "opencv-python",
     "Pillow",
@@ -19,7 +21,30 @@ dependencies = [
     "google-auth-httplib2",
     "ultralytics",
     "gdown",
+    "pyannote.audio",
+    "torch",
+    "torchaudio",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "pydantic",
+    "edge-tts",
 ]
 
 [project.scripts]
 clipping = "main:main"
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["clipping*", "web*", "youtube_uploader*", "facebook_uploader*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

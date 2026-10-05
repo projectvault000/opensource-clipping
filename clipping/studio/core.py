@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 
 import cv2
+from .. import audio_mastering, broll_policy, final_metadata, pacing, voiceover
 import mediapipe as mp
 import numpy as np
 import requests
@@ -29,6 +30,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageDraw, ImageFont
 from yt_dlp import YoutubeDL
+from ..visual_plan import compute_voiceover_visual_plan as _compute_voiceover_visual_plan
 
 def _load_studio_internal_module(file_name: str, module_alias: str):
     module_path = os.path.join(os.path.dirname(__file__), file_name)
@@ -91,6 +93,92 @@ v2_helpers = _load_studio_internal_module("v2_helpers.py", "clipping_studio_v2_h
 edge_glow_mod = _load_studio_internal_module("edge_glow.py", "clipping_studio_edge_glow")
 generate_edge_glow_video = edge_glow_mod.generate_edge_glow_video
 
+
+def _append_hook_headline(ass_path: str, text: str, duration: float) -> None:
+    """Add a brief hook headline in the top safe region of the existing ASS track."""
+    safe_text = str(text or "").replace("\\", "").replace("{", "").replace("}", "")
+    safe_text = " ".join(safe_text.split())
+    safe_duration = max(float(duration or 0.0), 0.1)
+    if not safe_text or not os.path.exists(ass_path):
+        return
+    end_time = f"0:00:{safe_duration:05.2f}"
+    with open(ass_path, "a", encoding="utf-8") as ass_file:
+        ass_file.write(
+            f"Dialogue: 1,0:00:00.00,{end_time},Default,,0,0,0,,{{\\an8\\bord4\\shad1}}{safe_text}\n"
+        )
+
+
+def _build_commentary_visual_source(
+    output_path: str,
+    source_path: str,
+    mode: str,
+    source_start: float,
+    source_end: float,
+    narration_duration: float,
+    cfg=None,
+    ratio="9:16",
+    label="VO visual",
+) -> bool:
+    """Render commentary visuals through the shared stable vertical crop when available."""
+    if not source_path or not os.path.exists(source_path):
+        return False
+
+    safe_mode = str(mode or "continue").lower().strip() or "continue"
+    safe_duration = max(float(narration_duration or 0.0), 0.5)
+    safe_start = max(float(source_start or 0.0), 0.0)
+    safe_end = max(float(source_end or safe_start + 0.1), safe_start + 0.1)
+    segment_dur = max(safe_end - safe_start, 0.1)
+
+    framed_path = output_path + ".framed.mp4"
+    framed_ready = False
+    try:
+        if cfg is not None:
+            try:
+                buat_video_hybrid(
+                    source_path,
+                    framed_path,
+                    safe_start,
+                    safe_end,
+                    ratio,
+                    cfg,
+                    [],
+                    label=label,
+                )
+                framed_ready = os.path.exists(framed_path) and os.path.getsize(framed_path) > 0
+            except Exception as exc:
+                print(f"⚠️ [Framing] {label} analysis unavailable; using safe crop fallback ({exc}).")
+
+        vf = "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        if safe_mode == "zoom":
+            vf = "fps=30,scale=iw*1.08:ih*1.08:eval=frame,crop=iw/1.08:ih/1.08,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        if framed_ready:
+            if segment_dur < safe_duration:
+                cmd += ["-stream_loop", "-1"]
+            cmd += ["-i", framed_path]
+        else:
+            if segment_dur < safe_duration:
+                cmd += ["-stream_loop", "-1"]
+            cmd += ["-ss", str(safe_start), "-to", str(safe_end), "-i", source_path]
+
+        cmd += [
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-t", str(safe_duration),
+            output_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        return os.path.exists(output_path)
+    except subprocess.CalledProcessError:
+        return False
+    finally:
+        if os.path.exists(framed_path):
+            os.remove(framed_path)
+
+
 def proses_klip(
     rank, clip, rasio, glitch_ts, data_segmen, cfg, video_encoder, diarization_data=None
 ):
@@ -112,12 +200,14 @@ def proses_klip(
     """
     get_x_h = None
     get_x_main = None
-    h_start = float(clip.get("hook_start_time", clip["start_time"]))
+    hook_plan = clip.get("hook_plan") if isinstance(clip.get("hook_plan"), dict) else {}
+    hook_type = str(hook_plan.get("type") or "source_teaser")
+    h_start = float(hook_plan.get("source_start", clip.get("hook_start_time", clip["start_time"])))
     h_end = float(
-        clip.get(
+        hook_plan.get("source_end", clip.get(
             "hook_end_time",
             clip.get("hook_start_time", clip["start_time"]) + cfg.durasi_hook,
-        )
+        ))
     )
     
     # Custom Hook Override
@@ -146,6 +236,41 @@ def proses_klip(
     m_end = float(clip["end_time"])
     judul = clip.get("title_indonesia")
     judul_en = clip.get("title_inggris")
+
+    raw_keep_segments = clip.get("keep_segments")
+    pacing_result = pacing.build_pacing_edit_map(
+        m_start,
+        m_end,
+        data_segmen,
+        base_segments=raw_keep_segments,
+        enabled=not getattr(cfg, "no_segment_trim", False),
+    )
+    if pacing_result["candidate_count"] or pacing_result["removed_duration"]:
+        print(
+            f"[Pacing] Detected {pacing_result['candidate_count']} long pause candidates; "
+            f"shortened {pacing_result['shortened_pause_count']}, "
+            f"preserved {pacing_result['preserved_pause_count']}."
+        )
+        print(
+            f"[Pacing] Retained source {pacing_result['source_duration']:.1f}s "
+            f"→ output {pacing_result['output_duration']:.1f}s; "
+            f"removed {pacing_result['removed_duration']:.1f}s."
+        )
+
+    legacy_transition_duration = (
+        1.0
+        if not getattr(cfg, "hook_v2", False)
+        and getattr(cfg, "use_hook_glitch", True)
+        and getattr(cfg, "durasi_hook", 3) > 0
+        and glitch_ts
+        and os.path.exists(glitch_ts)
+        else 0.0
+    )
+    hook_output_offset = voiceover.estimate_hook_output_offset(
+        clip,
+        cfg,
+        legacy_transition_duration=legacy_transition_duration,
+    )
     
     out_vid = os.path.join(cfg.outputs_dir, f"highlight_rank_{rank}_ready.mp4")
     if getattr(cfg, "dev_mode_with_output_merge", False):
@@ -159,6 +284,20 @@ def proses_klip(
     sh = int(cap_asli.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap_asli.release()
     source_dim = (sw, sh)
+
+    vo_plan = clip.get("voiceover", {}).get("plan") if isinstance(clip.get("voiceover"), dict) else None
+    vo_timeline = voiceover.build_commentary_timeline(
+        vo_plan,
+        clip_duration=max(float(m_end) - float(m_start), 0.0),
+        initial_output_offset=hook_output_offset,
+    ) if isinstance(vo_plan, dict) else []
+    for timeline_segment in vo_timeline:
+        if timeline_segment.get("type") == "commentary":
+            source_anchor = m_start + float(timeline_segment.get("insert_after_source_time", 0.0))
+            timeline_segment["pacing_main_output_anchor"] = pacing.map_source_time(
+                pacing_result["map"],
+                source_anchor,
+            )
 
     manifest_item = {
         "rank": rank,
@@ -182,11 +321,30 @@ def proses_klip(
         "end_time": m_end,
         "hook_start_time": h_start,
         "hook_end_time": h_end,
+        "hook_plan": hook_plan,
+        "hook_output_offset": hook_output_offset,
         "duration": round(m_end - m_start, 2),
+        "pacing_map": pacing_result["map"],
+        "pacing_source_duration": pacing_result["source_duration"],
+        "pacing_output_duration": pacing_result["output_duration"],
+        "pacing_removed_duration": pacing_result["removed_duration"],
         "alasan": clip.get("alasan", ""),
         "broll_list": clip.get("broll_list", []),
+        "broll_assets": [],
+        "broll_fallbacks": [],
+        "audio_mastering": {"status": "pending"},
         "typography_plan": clip.get("typography_plan", []),
+        "voiceover_plan": vo_plan,
+        "voiceover_timeline": vo_timeline,
     }
+    metadata_package = final_metadata.validate_metadata_package(manifest_item)
+    manifest_item["youtube_title_final"] = metadata_package["title"]
+    manifest_item["title_inggris"] = metadata_package["title"]
+    if not manifest_item.get("youtube_description_final"):
+        manifest_item["youtube_description_final"] = metadata_package["description"]
+    manifest_item["thumbnail_text"] = metadata_package["thumbnail_text"]
+    manifest_item["metadata_warnings"] = metadata_package["warnings"]
+    manifest_item["final_edit_context"] = final_metadata.build_final_edit_context(manifest_item)
 
     print(f"\n{'=' * 70}")
     print(f"🔥 [Rank {rank}] Memproses clip")
@@ -211,7 +369,7 @@ def proses_klip(
     h_ts_dev = f"h_{rank}_dev.ts"
     m_ts_dev = f"m_{rank}_dev.ts"
     
-    aktif_hook = cfg.use_hook_glitch
+    aktif_hook = bool(cfg.use_hook_glitch and (getattr(cfg, "durasi_hook", 3) > 0))
 
 
     # Determine if we should use split-screen mode
@@ -236,16 +394,67 @@ def proses_klip(
     )
 
     broll_list = clip.get("broll_list", [])
+    if not isinstance(broll_list, list):
+        broll_list = []
     broll_aktif = []
     if cfg.use_broll and broll_list:
         print(f"   🎥 Mendownload {len(broll_list)} video B-Roll dari Pexels...")
         for i, br in enumerate(broll_list):
-            q = br.get("search_query", "nature")
-            file_broll = f"temp_broll_{rank}_{i}.mp4"
-            if download_pexels_broll(q, rasio, file_broll, cfg.pexels_api_key):
+            if not isinstance(br, dict):
+                manifest_item["broll_fallbacks"].append({"reason": "invalid B-roll plan"})
+                continue
+            query = broll_policy.normalize_broll_query(br.get("search_query"))
+            try:
+                broll_start = float(br.get("start_time"))
+                broll_end = float(br.get("end_time"))
+            except (TypeError, ValueError):
+                broll_start, broll_end = -1.0, -1.0
+            if (
+                query is None
+                or not math.isfinite(broll_start)
+                or not math.isfinite(broll_end)
+                or broll_start < m_start
+                or broll_end > m_end
+                or broll_end <= broll_start
+            ):
+                manifest_item["broll_fallbacks"].append({
+                    "query": str(br.get("search_query") or ""),
+                    "reason": "invalid query or source range",
+                })
+                continue
+            if not any(
+                float(segment["end_time"]) > broll_start
+                and float(segment["start_time"]) < broll_end
+                for segment in pacing_result["render_segments"]
+            ):
+                manifest_item["broll_fallbacks"].append({
+                    "query": query,
+                    "reason": "B-roll range is outside the retained source timeline",
+                })
+                continue
+
+            file_broll = os.path.join(cfg.outputs_dir, f"temp_broll_{rank}_{i}.mp4")
+            if download_pexels_broll(
+                query,
+                rasio,
+                file_broll,
+                cfg.pexels_api_key,
+                minimum_duration=(broll_end - broll_start) + 0.1,
+                output_dir=cfg.outputs_dir,
+                visual_intent=br.get("visual_intent"),
+            ):
                 br_copy = dict(br)
-                br_copy["filepath"] = file_broll
+                br_copy.update({"filepath": file_broll, "search_query": query})
                 broll_aktif.append(br_copy)
+                asset_metadata = broll_policy.get_asset_metadata(cfg.outputs_dir, file_broll)
+                if asset_metadata:
+                    manifest_item["broll_assets"].append(asset_metadata)
+            else:
+                print(f"   ⚠️ B-roll failed for '{query}'; source footage will remain visible.")
+                manifest_item["broll_fallbacks"].append({
+                    "query": query,
+                    "reason": "Pexels search/download/media validation failed",
+                })
 
     std_p = get_ts_encode_args(video_encoder, fps=30)
 
@@ -410,6 +619,16 @@ def proses_klip(
                     source_dim=source_dim,
                 )
 
+                commentary_hook_audio_ready = (
+                    hook_type == "commentary_hook"
+                    and isinstance(clip.get("voiceover"), dict)
+                    and os.path.exists(clip["voiceover"].get("audio_path", ""))
+                )
+                if hook_type in {"text_hook", "question_hook"} or (
+                    hook_type == "commentary_hook" and not commentary_hook_audio_ready
+                ):
+                    _append_hook_headline(a_hook, hook_plan.get("text", ""), h_end - h_start)
+
                 print("   🎬 [Hook] FFmpeg burn subtitle + audio...")
                 esc_ass_hook = escape_ffmpeg_filter_value(os.path.abspath(a_hook))
                 esc_fontsdir = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
@@ -454,10 +673,14 @@ def proses_klip(
                 raise RuntimeError("FFmpeg hook gagal:\n" + "\n".join(err_h))
 
         # MAIN
-        keep_segments = clip.get("keep_segments")
+        keep_segments = pacing_result["render_segments"]
         use_segments = (
             keep_segments
-            and len(keep_segments) > 1
+            and (
+                len(keep_segments) > 1
+                or pacing_result["changed"]
+                or (isinstance(raw_keep_segments, list) and len(raw_keep_segments) > 1)
+            )
             and not getattr(cfg, "no_segment_trim", False)
         )
 
@@ -728,23 +951,15 @@ def proses_klip(
         # VOICE-OVER INTRO GENERATION
         vo_ts = None
         vo_ts_dev = None
+        vo_render_duration = 0.0
+        ass_vo = None
+        subtitle_files_for_qc = []
         vo_data = clip.get("voiceover")
         if vo_data and os.path.exists(vo_data["audio_path"]):
             vo_ts = os.path.join(cfg.outputs_dir, f"vo_intro_{rank}.ts")
             vo_ts_dev = os.path.join(cfg.outputs_dir, f"vo_intro_{rank}_dev.ts")
-            print("   📸 [VO] Render voice-over intro (freeze frame + equalizer)...")
-            
-            # Extract first frame
-            frame_path = os.path.join(cfg.outputs_dir, f"vo_bg_{rank}.jpg")
-            try:
-                subprocess.run([
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-ss", str(m_start), "-i", cfg.file_video_asli,
-                    "-vframes", "1", "-q:v", "2", frame_path
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            except subprocess.CalledProcessError as e:
-                raise RuntimeError(f"Gagal mengekstrak frame awal untuk VO Intro:\n{e.stderr}")
-            
+            print("   📸 [VO] Render voice-over intro with moving source footage...")
+
             try:
                 # Dapatkan durasi asli dari mp3 menggunakan ffprobe agar tidak terpotong
                 res = subprocess.run([
@@ -754,10 +969,101 @@ def proses_klip(
                 vo_duration = float(res.stdout.strip()) + 0.5
             except Exception:
                 vo_duration = float(vo_data["segments"][-1]["end"]) + 0.5 if vo_data.get("segments") else 5.0
-            
+            vo_render_duration = vo_duration
+
+            source_visual_path = os.path.join(cfg.outputs_dir, f"vo_source_{rank}.mp4")
+            source_visual_dur = max(float(m_end) - float(m_start), 0.1)
+            visual_plan = _compute_voiceover_visual_plan(source_visual_dur, vo_duration)
+
+            visual_choice = voiceover.resolve_commentary_visual(vo_plan, source_duration=source_visual_dur) if isinstance(vo_plan, dict) else {"mode": "continue"}
+            chosen_visual_mode = str(visual_choice.get("mode") or "continue").lower().strip() or "continue"
+            print(f"   🧠 [VO] Visual mode: {chosen_visual_mode}")
+
+            try:
+                if chosen_visual_mode == "continue":
+                    if os.path.exists(m_silent) and not use_segments:
+                        shutil.copyfile(m_silent, source_visual_path)
+                    elif not _build_commentary_visual_source(
+                        source_visual_path,
+                        cfg.file_video_asli,
+                        "continue",
+                        m_start,
+                        m_end,
+                        vo_duration,
+                        cfg=cfg,
+                        ratio=rasio,
+                        label=f"Rank {rank} VO Continue",
+                    ):
+                        raise RuntimeError("Gagal menyiapkan CONTINUE commentary visual")
+                elif chosen_visual_mode == "replay":
+                    replay_start = float(visual_choice.get("source_start", m_start))
+                    replay_end = float(visual_choice.get("source_end", m_end))
+                    if replay_end <= replay_start:
+                        replay_start, replay_end = m_start, m_end
+                    if not _build_commentary_visual_source(
+                        source_visual_path, cfg.file_video_asli, "replay",
+                        replay_start, replay_end, vo_duration,
+                        cfg=cfg, ratio=rasio, label=f"Rank {rank} VO Replay",
+                    ):
+                        raise RuntimeError("Gagal menyiapkan replay commentary visual")
+                elif chosen_visual_mode == "zoom":
+                    zoom_start = float(visual_choice.get("source_start", m_start))
+                    zoom_end = float(visual_choice.get("source_end", m_end))
+                    if zoom_end <= zoom_start:
+                        zoom_start, zoom_end = m_start, m_end
+                    if not _build_commentary_visual_source(
+                        source_visual_path, cfg.file_video_asli, "zoom",
+                        zoom_start, zoom_end, vo_duration,
+                        cfg=cfg, ratio=rasio, label=f"Rank {rank} VO Zoom",
+                    ):
+                        raise RuntimeError("Gagal menyiapkan zoom commentary visual")
+                elif chosen_visual_mode == "broll" and getattr(cfg, "use_broll", False):
+                    broll_query = broll_policy.normalize_broll_query(visual_choice.get("query"))
+                    broll_intent = broll_policy.normalize_visual_intent(visual_choice.get("visual_intent"))
+                    broll_temp = os.path.join(cfg.outputs_dir, f"vo_broll_{rank}.mp4")
+                    broll_ready = bool(
+                        broll_query
+                        and broll_intent
+                        and download_pexels_broll(
+                            broll_query,
+                            rasio,
+                            broll_temp,
+                            getattr(cfg, "pexels_api_key", None),
+                            minimum_duration=vo_duration + 0.25,
+                            output_dir=cfg.outputs_dir,
+                            visual_intent=broll_intent,
+                        )
+                    )
+                    if broll_ready:
+                        source_visual_path = broll_temp
+                        asset_metadata = broll_policy.get_asset_metadata(cfg.outputs_dir, broll_temp)
+                        if asset_metadata:
+                            manifest_item["broll_assets"].append(asset_metadata)
+                    else:
+                        print("   ⚠️ [VO] B-roll unavailable or invalid; falling back to CONTINUE.")
+                        manifest_item["broll_fallbacks"].append({
+                            "query": str(visual_choice.get("query") or ""),
+                            "reason": "Pexels search/download/media validation failed",
+                        })
+                        if not _build_commentary_visual_source(
+                            source_visual_path, cfg.file_video_asli, "continue",
+                            m_start, m_end, vo_duration,
+                            cfg=cfg, ratio=rasio, label=f"Rank {rank} VO B-roll fallback",
+                        ):
+                            raise RuntimeError("Gagal menyiapkan B-roll fallback visual")
+                else:
+                    if not _build_commentary_visual_source(
+                        source_visual_path, cfg.file_video_asli, "continue",
+                        m_start, m_end, vo_duration,
+                        cfg=cfg, ratio=rasio, label=f"Rank {rank} VO visual fallback",
+                    ):
+                        raise RuntimeError("Gagal menyiapkan source visual fallback")
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Gagal menyiapkan visual bergerak untuk VO Intro:\n{e.stderr}")
+
             # Generate for both normal and dev dual if needed
             out_targets_vo = [vo_ts] if not dev_dual else [vo_ts, vo_ts_dev]
-            
+
             for output_vo_ts in out_targets_vo:
                 vo_w, vo_h = _get_render_dims(cfg, rasio, source_h=sh)
                 if dev_dual and output_vo_ts == vo_ts_dev:
@@ -766,16 +1072,16 @@ def proses_klip(
                     vo_w, vo_h = 2648, 1220
                 elif getattr(cfg, "dev_mode", False) and not dev_dual:
                     vo_w, vo_h = 1920, 1080
-                    
+
                 ass_vo_filter = ""
                 overlay_out = "[v_out]"
-                
+
                 # Buat file ASS subtitle khusus untuk VO intro jika ada segments
                 if not cfg.no_subs and vo_data.get("segments"):
                     ass_vo = os.path.join(cfg.outputs_dir, f"vo_subs_{rank}.ass")
                     buat_file_ass(
                         vo_data["segments"],
-                        0.0, # Waktu relatif mulai dari 0 karena ini file terpisah
+                        0.0,
                         vo_duration,
                         ass_vo,
                         rasio,
@@ -783,7 +1089,7 @@ def proses_klip(
                         typography_plan=typography_plan,
                         gunakan_advanced=True,
                         get_x_func=get_x_main,
-                        source_dim=(vo_w, vo_h) 
+                        source_dim=(vo_w, vo_h)
                     )
                     esc_ass_vo = escape_ffmpeg_filter_value(os.path.abspath(ass_vo))
                     esc_fontsdir_vo = escape_ffmpeg_filter_value(os.path.abspath(cfg.font_dir))
@@ -796,16 +1102,14 @@ def proses_klip(
                 print(f"   ✨ [VO] Generating ambient edge glow (mode={glow_mode})...")
 
                 if glow_mode == "full":
-                    # Render full duration — no loop needed, zero stutter
                     glow_dur = vo_duration
                     glow_seamless = False
                     glow_needs_loop = False
                 elif glow_mode == "smooth":
-                    # 10s loop with seamless speed adjustment
                     glow_dur = min(10.0, vo_duration)
                     glow_seamless = True
                     glow_needs_loop = glow_dur < vo_duration
-                else:  # "default" — original behavior
+                else:
                     glow_dur = min(10.0, vo_duration)
                     glow_seamless = False
                     glow_needs_loop = glow_dur < vo_duration
@@ -819,56 +1123,30 @@ def proses_klip(
                     seamless_loop=glow_seamless,
                 )
 
-                # Build filter: bg_frame → overlay glow → overlay spectrum → [subtitles]
-                
                 # =========================
                 # Manual Wave/Spectrum Config
                 # =========================
-                
                 wave_enabled = True
-                
-                # Ukuran wave
                 wave_w = 800
                 wave_h = 260
-                
-                # Smoothness visual
-                # Pakai 30 kalau render final 30fps
-                # Pakai 60 kalau render final 60fps
                 wave_rate = 30
-                
-                # Biar tidak terlalu ramai
-                wave_lowpass = 300      # 250-400 cocok untuk VO
+                wave_lowpass = 300
                 wave_use_lowpass = True
-                
-                # Tampilan
-                wave_mode = "cline"     # cline lebih halus, line lebih tegas
+                wave_mode = "cline"
                 wave_color = "0x00FFFF"
-                wave_scale = "sqrt"     # sqrt lebih kalem dari linear
-                # Alternatif scale:
-                # "lin"  = linear/default, bentuk wave paling asli tapi bisa terlihat ramai/agresif
-                # "sqrt" = lebih smooth dan seimbang, cocok untuk VO
-                # "cbrt" = lebih kalem/soft dari sqrt, cocok jika wave masih terlalu ramai
-                # "log"  = detail kecil lebih terlihat, tapi kadang malah terasa lebih aktif/ramai
-                
-                
-                # Transparansi wave
-                wave_alpha = 0.65       # 0.4-0.8, makin kecil makin soft
-                
-                # Posisi overlay wave
+                wave_scale = "sqrt"
+                wave_alpha = 0.65
                 wave_x = "(W-w)/2"
                 wave_y = "(H-h)/2"
-                
-                # Colorkey untuk hilangkan background hitam dari showwaves
                 wave_key_color = "0x000000"
                 wave_key_similarity = 0.1
                 wave_key_blend = 0.1
-                
 
                 if wave_use_lowpass:
                     wave_audio_filter = f"[vo_wave_in]lowpass=f={wave_lowpass}"
                 else:
                     wave_audio_filter = "[vo_wave_in]anull"
-                
+
                 wave_filter = (
                     f"{wave_audio_filter},"
                     f"showwaves="
@@ -883,55 +1161,60 @@ def proses_klip(
                     f"[wave_v]; "
                 )
 
-                # Build filter: bg_frame → overlay glow → overlay spectrum → [subtitles]
-                # Input 0: freeze frame (looped)
-                # Input 1: VO audio
-                # Input 2: edge glow video (stream_looped)
-                # Input 3 (optional): BGM
-                
                 v_filter_vo = (
                     f"[0:v]scale={vo_w}:{vo_h}:force_original_aspect_ratio=increase,"
                     f"crop={vo_w}:{vo_h},"
                     f"colorchannelmixer=rr=0.3:gg=0.3:bb=0.3[v_bg]; "
-                
                     f"[2:v]scale={vo_w}:{vo_h}[glow_scaled]; "
-                
                     f"[v_bg][glow_scaled]blend=all_mode=screen:shortest=1[v_glowed]; "
-                
                     f"[1:a]asplit=2[vo_a][vo_wave_in]; "
-                
                     f"{wave_filter}"
-                
                     f"[v_glowed][wave_v]overlay={wave_x}:{wave_y}:shortest=1{overlay_out}"
                     f"{ass_vo_filter}"
                 )
-                
+
                 cmd_vo_base = [
                     "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-loop", "1", "-framerate", "30", "-i", frame_path,
-                    "-i", vo_data["audio_path"],
                 ]
+                if visual_plan["loop_required"]:
+                    cmd_vo_base.extend(["-stream_loop", "-1", "-i", source_visual_path])
+                else:
+                    cmd_vo_base.extend(["-i", source_visual_path])
+                cmd_vo_base.extend(["-i", vo_data["audio_path"]])
+
                 if glow_needs_loop:
                     cmd_vo_base.extend(["-stream_loop", "-1", "-i", glow_path])
                 else:
                     cmd_vo_base.extend(["-i", glow_path])
-                
-                # Audio mixing with BGM for VO intro
-                # Input indices: 0=frame, 1=audio, 2=glow, 3=bgm (if present)
+
                 if aktif_bgm and file_bgm:
                     cmd_vo_base.extend(["-stream_loop", "-1", "-i", file_bgm])
                     bgm_vol = cfg.bgm_base_volume
                     vo_vol = getattr(cfg, "voiceover_volume", 1.0)
+                    vo_fade_filter = voiceover.build_commentary_audio_filter(
+                        source_audio_label=None,
+                        narration_audio_label="[vo_a]",
+                        original_volume=getattr(cfg, "original_volume", 0.15),
+                        voiceover_volume=vo_vol,
+                        narration_duration=vo_duration,
+                    )
                     audio_filter_vo = (
                         f"[3:a]volume={bgm_vol}[bgm_vol]; "
-                        f"[vo_a]volume={vo_vol}[vo_loud]; "
-                        f"[bgm_vol][vo_loud]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
+                        f"{vo_fade_filter}; "
+                        f"[bgm_vol][a_out]amix=inputs=2:duration=first:dropout_transition=2[a_out_final]"
                     )
                     v_filter_vo += f"; {audio_filter_vo}"
                 else:
                     vo_vol = getattr(cfg, "voiceover_volume", 1.0)
-                    v_filter_vo += f"; [vo_a]volume={vo_vol}[a_out]"
-                    
+                    vo_fade_filter = voiceover.build_commentary_audio_filter(
+                        source_audio_label=None,
+                        narration_audio_label="[vo_a]",
+                        original_volume=getattr(cfg, "original_volume", 0.15),
+                        voiceover_volume=vo_vol,
+                        narration_duration=vo_duration,
+                    )
+                    v_filter_vo += f"; {vo_fade_filter}"
+
                 cmd_vo_base.extend([
                     "-filter_complex", v_filter_vo,
                     "-map", "[v_out]", "-map", "[a_out]", "-t", str(vo_duration)
@@ -944,8 +1227,8 @@ def proses_klip(
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError(f"FFmpeg VO intro gagal (Rank {rank}):\nCommand: {' '.join(cmd_vo_base)}\nError:\n{e.stderr}")
                 
-            if os.path.exists(frame_path):
-                os.remove(frame_path)
+            if os.path.exists(source_visual_path):
+                os.remove(source_visual_path)
             if os.path.exists(glow_path):
                 os.remove(glow_path)
 
@@ -1078,10 +1361,88 @@ def proses_klip(
                     if os.path.exists(glow_full_path):
                         os.remove(glow_full_path)
 
-        judul_thumbnail = judul_en or judul or f"Highlight {rank}"
-        buat_thumbnail(out_vid, out_thm, judul_thumbnail, cfg)
+        thumbnail_text = final_metadata.choose_thumbnail_text(clip)
+        judul_thumbnail = thumbnail_text or judul_en or judul or f"Highlight {rank}"
+        audio_mastering_result = audio_mastering.master_audio_in_place(out_vid)
+        manifest_item["audio_mastering"] = audio_mastering_result
+        thumbnail_source_time = buat_thumbnail(
+            out_vid,
+            out_thm,
+            judul_thumbnail,
+            cfg,
+        )
+        manifest_item["thumbnail_text"] = judul_thumbnail
+        manifest_item["thumbnail_source_time"] = thumbnail_source_time
 
-        manifest_item["status"] = "success"
+        vo_enabled = bool(getattr(cfg, "voiceover", False) and isinstance(vo_data, dict) and vo_data.get("audio_path"))
+        for subtitle_path in (a_hook, a_main, ass_vo):
+            if subtitle_path and os.path.exists(subtitle_path):
+                subtitle_files_for_qc.append(subtitle_path)
+        expected_output_duration = (
+            pacing_result["output_duration"]
+            + hook_output_offset
+            + vo_render_duration
+        )
+        final_pacing_map = pacing.shift_output_map(
+            pacing_result["map"],
+            hook_output_offset + vo_render_duration,
+        )
+        pacing_validation = pacing.validate_pacing_map(
+            final_pacing_map,
+            expected_output_duration,
+        )
+        manifest_item["pacing_final_map"] = final_pacing_map
+
+        qc_result = voiceover.validate_final_output(
+            out_vid,
+            expected_duration=expected_output_duration,
+            expected_ratio=getattr(cfg, "pilihan_rasio", None),
+            voiceover_enabled=vo_enabled,
+            commentary_plan=vo_plan if isinstance(vo_plan, dict) else None,
+            commentary_audio_paths=[vo_data["audio_path"]] if vo_enabled and isinstance(vo_data, dict) and vo_data.get("audio_path") else None,
+            subtitle_paths=subtitle_files_for_qc or None,
+            caption_segments=vo_data.get("segments") if vo_enabled and isinstance(vo_data, dict) else None,
+        )
+        if manifest_item["broll_fallbacks"]:
+            qc_result["warnings"].append(
+                f"{len(manifest_item['broll_fallbacks'])} B-roll request(s) fell back to source footage."
+            )
+            if qc_result["status"] == "pass":
+                qc_result["status"] = "warning"
+        if audio_mastering_result.get("status") == "fallback":
+            qc_result["warnings"].append(
+                "Final audio mastering fell back to the pre-master mix."
+            )
+            if qc_result["status"] == "pass":
+                qc_result["status"] = "warning"
+        if audio_mastering_result.get("status") == "mastered":
+            post_audio = audio_mastering_result.get("post") or {}
+            measured_lufs = post_audio.get("integrated_lufs")
+            measured_peak = post_audio.get("true_peak_db")
+            loudness_ok = measured_lufs is not None and abs(measured_lufs - audio_mastering.TARGET_I) <= 1.5
+            peak_ok = measured_peak is not None and measured_peak <= audio_mastering.TARGET_TP + 0.2
+            qc_result["checks"]["audio_loudness"] = "pass" if loudness_ok else "warning"
+            qc_result["checks"]["audio_true_peak"] = "pass" if peak_ok else "warning"
+            if not loudness_ok or not peak_ok:
+                qc_result["warnings"].append("Final audio measurements are outside the preferred mastering tolerance.")
+                if qc_result["status"] == "pass":
+                    qc_result["status"] = "warning"
+        qc_result["checks"]["pacing_timeline"] = "pass" if pacing_validation["valid"] else "fail"
+        if not pacing_validation["valid"]:
+            qc_result["status"] = "fail"
+            qc_result["errors"].extend(pacing_validation["errors"])
+        manifest_item["quality_control"] = qc_result
+        manifest_item["quality_status"] = qc_result["status"]
+        if qc_result["status"] == "fail":
+            manifest_item["status"] = "failed"
+            print(f"⚠️ [Rank {rank}] Final QC failed: {'; '.join(qc_result['errors'])[:250]}")
+        elif qc_result["status"] == "warning":
+            manifest_item["status"] = "success"
+            print(f"⚠️ [Rank {rank}] Final QC warning: {'; '.join(qc_result['warnings'])[:250]}")
+        else:
+            manifest_item["status"] = "success"
+            print(f"✅ [Rank {rank}] Final QC passed.")
+
         manifest_item["video_exists"] = os.path.exists(out_vid)
         manifest_item["thumbnail_exists"] = os.path.exists(out_thm)
 

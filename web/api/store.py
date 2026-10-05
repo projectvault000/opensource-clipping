@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import os
 import threading
-import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+from clipping.checkpoints import deterministic_job_id
 
 from .models import (
     ClipDetail,
@@ -99,8 +100,17 @@ def create_job(
     config: dict | None = None,
     job_id: str | None = None,
 ) -> str:
-    """Create a new job and return its ID."""
-    job_id = job_id or uuid.uuid4().hex[:12]
+    """Create a new job and return its ID.
+
+    If no explicit identifier is provided, derive a deterministic ID from
+    the source URL and config fingerprint so identical work can be resumed
+    reliably after reconnects or partial failures.
+    """
+    if job_id is None:
+        normalized_config = dict(config or {})
+        normalized_config.setdefault("source", source)
+        normalized_config.setdefault("upload_filename", upload_filename)
+        job_id = deterministic_job_id(url, normalized_config)
     now = _now()
     with _lock:
         _jobs[job_id] = {

@@ -43,7 +43,7 @@ build_ffmpeg_progress_cmd = _ffmpeg_utils.build_ffmpeg_progress_cmd
 run_ffmpeg_with_progress = _ffmpeg_utils.run_ffmpeg_with_progress
 
 
-def buat_thumbnail(video_path, output_image_path, teks, cfg):
+def buat_thumbnail(video_path, output_image_path, teks, cfg, candidate_times=None):
     """
     Extract a frame from the video, composite the clip title on top, and save as a thumbnail image.
 
@@ -70,12 +70,35 @@ def buat_thumbnail(video_path, output_image_path, teks, cfg):
         urllib.request.urlretrieve(cfg.url_font_thumbnail, cfg.file_font_thumbnail)
 
     cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_MSEC, 5000)
-    ret, frame = cap.read()
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    duration = frame_count / fps if fps > 0 else 0.0
+    times = candidate_times or [0.0, duration * 0.15, duration * 0.35, duration * 0.55]
+    best_frame = None
+    best_time = None
+    best_score = float("-inf")
+    for candidate_time in times:
+        safe_time = min(max(float(candidate_time), 0.0), max(duration - 0.05, 0.0))
+        cap.set(cv2.CAP_PROP_POS_MSEC, safe_time * 1000)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_brightness = float(gray.mean())
+        if mean_brightness < 12.0:
+            continue
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        score = min(sharpness, 5000.0) + min(mean_brightness, 180.0) * 0.25
+        if score > best_score:
+            best_score = score
+            best_frame = frame.copy()
+            best_time = safe_time
     cap.release()
 
-    if not ret:
-        return
+    if best_frame is None:
+        return None
+
+    frame = best_frame
 
     img = Image.alpha_composite(
         Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA"),
@@ -103,5 +126,6 @@ def buat_thumbnail(video_path, output_image_path, teks, cfg):
         y_text += font_sz + 10
 
     img.save(output_image_path)
+    return best_time
 
 

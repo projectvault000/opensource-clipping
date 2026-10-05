@@ -5,6 +5,7 @@ Maps to the QA Metadata Preview cell in the notebook.
 """
 
 import json
+import math
 
 
 # ==============================================================================
@@ -13,6 +14,175 @@ import json
 
 def _normalize_spaces(text):
     return " ".join(str(text or "").split()).strip()
+
+
+HOOK_PLAN_TYPES = {"source_teaser", "commentary_hook", "text_hook", "question_hook"}
+
+
+def normalize_hook_plan(item):
+    """Validate structured hook intent and fall back to the legacy source teaser."""
+    clip_start = _finite_float(item.get("start_time"), 0.0)
+    clip_end = _finite_float(item.get("end_time"), clip_start)
+    legacy_start = _finite_float(item.get("hook_start_time"), clip_start)
+    legacy_end = _finite_float(item.get("hook_end_time"), legacy_start + 3.0)
+
+    if not (clip_end > clip_start):
+        clip_end = clip_start + 3.0
+    fallback_start = min(max(legacy_start, clip_start), clip_end)
+    fallback_end = min(max(legacy_end, fallback_start), clip_end)
+    if fallback_end <= fallback_start:
+        fallback_start = clip_start
+        fallback_end = min(clip_start + 3.0, clip_end)
+    if fallback_end <= fallback_start:
+        fallback_end = fallback_start + 0.1
+
+    fallback = {
+        "type": "source_teaser",
+        "duration_target": fallback_end - fallback_start,
+        "text": "",
+        "source_start": fallback_start,
+        "source_end": fallback_end,
+        "fallback": True,
+    }
+    plan = item.get("hook_plan")
+    if not isinstance(plan, dict):
+        return fallback
+
+    hook_type = str(plan.get("type") or "").strip().lower()
+    text = _normalize_spaces(plan.get("text"))
+    start = _finite_float(plan.get("source_start"), None)
+    end = _finite_float(plan.get("source_end"), None)
+    duration = _finite_float(plan.get("duration_target"), None)
+    if (
+        hook_type not in HOOK_PLAN_TYPES
+        or duration is None
+        or duration < 0
+        or (duration == 0 and hook_type != "source_teaser")
+        or start is None
+        or end is None
+        or end <= start
+        or start < clip_start
+        or end > clip_end
+        or (hook_type != "source_teaser" and not text)
+    ):
+        return fallback
+
+    if hook_type in {"text_hook", "question_hook"} and len(text.split()) > 12:
+        return fallback
+    if hook_type == "commentary_hook" and len(text.split()) > 24:
+        return fallback
+
+    return {
+        "type": hook_type,
+        "duration_target": duration,
+        "text": text,
+        "source_start": start,
+        "source_end": end,
+        "fallback": False,
+    }
+
+
+def _finite_float(value, default):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def validate_story_candidates(
+    candidates,
+    source_duration=None,
+    min_duration=20.0,
+    max_duration=179.0,
+    overlap_threshold=0.7,
+):
+    """Validate source/core timing and suppress near-identical overlapping candidates."""
+    if not isinstance(candidates, list):
+        return []
+
+    safe_source_duration = _finite_float(source_duration, None)
+    validated = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        start_value = next(
+            (candidate.get(key) for key in ("start_time", "timing_klip_start", "clip_start", "start") if candidate.get(key) is not None),
+            None,
+        )
+        end_value = next(
+            (candidate.get(key) for key in ("end_time", "timing_klip_end", "clip_end", "end") if candidate.get(key) is not None),
+            None,
+        )
+        start = _finite_float(start_value, None)
+        end = _finite_float(end_value, None)
+        if start is None or end is None or start < 0 or end <= start:
+            continue
+        duration = end - start
+        if duration < min_duration or duration > max_duration:
+            continue
+        if safe_source_duration is not None and safe_source_duration > 0 and end > safe_source_duration:
+            continue
+
+        core_start = _finite_float(candidate.get("core_start_time"), start)
+        core_end = _finite_float(candidate.get("core_end_time"), end)
+        if core_start is None or core_end is None or core_start < start or core_end > end or core_end <= core_start:
+            core_start, core_end = start, end
+
+        raw_structure = candidate.get("story_structure")
+        raw_structure = raw_structure if isinstance(raw_structure, dict) else {}
+        story_structure = {}
+        for key in ("setup", "development", "payoff"):
+            value = raw_structure.get(key, False)
+            story_structure[key] = value is True or (
+                isinstance(value, str) and value.strip().lower() in {"true", "yes", "1"}
+            ) or (isinstance(value, (int, float)) and not isinstance(value, bool) and value == 1)
+
+        normalized = dict(candidate)
+        normalized.update({
+            "start_time": start,
+            "end_time": end,
+            "core_start_time": core_start,
+            "core_end_time": core_end,
+            "story_structure": story_structure,
+            "viral_score": _finite_float(candidate.get("viral_score"), 0.0),
+        })
+        validated.append(normalized)
+
+    validated.sort(key=lambda item: item["viral_score"], reverse=True)
+    distinct = []
+    for candidate in validated:
+        candidate_duration = candidate["end_time"] - candidate["start_time"]
+        candidate_core_duration = candidate["core_end_time"] - candidate["core_start_time"]
+        duplicate = False
+        for accepted in distinct:
+            overlap = max(
+                0.0,
+                min(candidate["end_time"], accepted["end_time"])
+                - max(candidate["start_time"], accepted["start_time"]),
+            )
+            shorter_duration = min(candidate_duration, accepted["end_time"] - accepted["start_time"])
+            if shorter_duration <= 0 or overlap / shorter_duration < overlap_threshold:
+                continue
+
+            core_overlap = max(
+                0.0,
+                min(candidate["core_end_time"], accepted["core_end_time"])
+                - max(candidate["core_start_time"], accepted["core_start_time"]),
+            )
+            shorter_core = min(
+                candidate_core_duration,
+                accepted["core_end_time"] - accepted["core_start_time"],
+            )
+            if shorter_core <= 0 or core_overlap / shorter_core >= 0.5:
+                duplicate = True
+                break
+
+        if not duplicate:
+            distinct.append(candidate)
+
+    return distinct
 
 
 def _trim_title(text, max_len=100):
@@ -101,12 +271,23 @@ def _looks_indonesian(text):
 # MAIN API
 # ==============================================================================
 
-def normalize_and_validate(hasil_json: list[dict]) -> list[dict]:
+def normalize_and_validate(
+    hasil_json: list[dict],
+    source_duration=None,
+    min_duration=20.0,
+    max_duration=179.0,
+) -> list[dict]:
     """
     Normalize and enrich metadata fields, add *_final fields.
 
     Mutates items in-place and returns sorted list.
     """
+    hasil_json = validate_story_candidates(
+        hasil_json,
+        source_duration=source_duration,
+        min_duration=min_duration,
+        max_duration=max_duration,
+    )
     valid_items = []
     laporan = []
     semua_warning = []
@@ -143,6 +324,11 @@ def normalize_and_validate(hasil_json: list[dict]) -> list[dict]:
         # Ensure hook exists as dict for later code
         if not isinstance(item.get("hook"), dict):
             item["hook"] = {"text": str(item.get("hook", "")), "start_time": item["start_time"], "end_time": item["start_time"] + 3.0}
+
+        hook_plan = normalize_hook_plan(item)
+        item["hook_plan"] = hook_plan
+        item["hook_start_time"] = hook_plan["source_start"]
+        item["hook_end_time"] = hook_plan["source_end"]
 
         item["title_indonesia"] = _trim_title(item.get("title_indonesia", ""))
         item["title_inggris"] = _trim_title(item.get("title_inggris", ""))

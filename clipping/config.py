@@ -221,6 +221,33 @@ def _parse_download_height(val: str) -> str | int:
         raise argparse.ArgumentTypeError("Download source height must be a positive integer.")
     return parsed
 
+
+def _positive_int(name: str):
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer.") from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError(f"{name} must be greater than 0.")
+        return parsed
+
+    return parse
+
+
+def _non_negative_float(name: str):
+    def parse(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be a number.") from exc
+        if parsed < 0:
+            raise argparse.ArgumentTypeError(f"{name} must be 0 or greater.")
+        return parsed
+
+    return parse
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="🎬 OpenSource Clipping — AI Auto-Clipper & Teaser Generator",
@@ -232,6 +259,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--url", "-u", required=False, default=None, nargs="+",
         help="One or more video URLs to process (space-separated). Supports YouTube, TikTok, Instagram, Google Drive. Required unless --story-mode is used.",
     )
+    p.add_argument("--job-status", type=str, default=None, help="Inspect the persisted review status for a job by job ID.")
+    p.add_argument("--clip-status", nargs=2, metavar=("JOB_ID", "CLIP_ID"), default=None, help="Inspect one clip in a job.")
+    p.add_argument("--approve", nargs=2, metavar=("JOB_ID", "CLIP_ID"), default=None, help="Mark a clip as approved.")
+    p.add_argument("--reject", nargs=2, metavar=("JOB_ID", "CLIP_ID"), default=None, help="Mark a clip as rejected.")
+    p.add_argument("--needs-changes", nargs=2, metavar=("JOB_ID", "CLIP_ID"), default=None, help="Mark a clip as needing changes.")
+    p.add_argument("--retry-clip", nargs=2, metavar=("JOB_ID", "CLIP_ID"), default=None, help="Rerender one clip marked NEEDS_CHANGES using its saved job plan.")
+    p.add_argument("--review-note", type=str, default="", help="Optional note stored with a review decision.")
+    p.add_argument("--approved-export", type=str, default=None, help="Create an approved export manifest/zip for a specific job ID.")
     p.add_argument(
         "--yt-cookies", type=str, default=None,
         help="Cookies from browser (e.g. 'chrome', 'firefox') or path to cookies.txt for yt-dlp",
@@ -251,7 +286,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--clips",
         "-n",
-        type=int,
+        type=_positive_int("--clips"),
         default=JUMLAH_CLIP,
         help="Number of highlight clips to generate",
     )
@@ -277,13 +312,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- Konten & Hook ---
     p.add_argument(
         "--words-per-sub",
-        type=int,
+        type=_positive_int("--words-per-sub"),
         default=MAX_KATA_PER_SUBTITLE,
         help="Max words per karaoke subtitle group",
     )
     p.add_argument(
         "--hook-duration",
-        type=int,
+        type=_non_negative_float("--hook-duration"),
         default=DURASI_HOOK,
         help="Hook teaser duration in seconds",
     )
@@ -529,7 +564,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--track-snap",
         type=float,
         default=None,
-        help="Face jump snap threshold (default: 0.25)",
+        help="Maximum normalized face jump accepted for temporal association (default: 0.25)",
     )
     p.add_argument(
         "--track-conf",
@@ -599,7 +634,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     hook_v2_group.add_argument(
         "--hook-v2-items",
-        type=int,
+        type=_positive_int("--hook-v2-items"),
         default=3,
         help="Number of micro-hooks to generate in V2 mode.",
     )
@@ -618,13 +653,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-segment-trim",
         action="store_true",
         default=False,
-        help="Disable AI segment trimming (render full start-to-end instead of keep_segments).",
+        help="Disable automatic segment trimming and pause pacing; render the full source range.",
     )
     hook_v2_group.add_argument(
         "--silence-trim",
         action="store_true",
         default=False,
-        help="Instruct AI to aggressively trim silence/dead air from clips.",
+        help="Ask AI for tighter segments; local pacing still preserves meaningful pauses.",
     )
 
     # --- Story Clip Mode ---
@@ -780,9 +815,17 @@ def build_config(argv: list[str] | None = None) -> SimpleNamespace:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    # Validate: --url is required unless --story-mode is used
-    if not args.story_mode and not args.url:
-        parser.error("--url is required unless --story-mode is used.")
+    review_commands = [
+        args.job_status,
+        args.clip_status,
+        args.approve,
+        args.reject,
+        args.needs_changes,
+        args.retry_clip,
+        args.approved_export,
+    ]
+    if not args.story_mode and not args.url and not any(review_commands):
+        parser.error("--url is required unless --story-mode or a review command is used.")
 
     # Normalize URL list for batch support
     url_list = args.url if isinstance(args.url, list) else ([args.url] if args.url else [])
@@ -944,6 +987,14 @@ def build_config(argv: list[str] | None = None) -> SimpleNamespace:
             else os.path.join(outputs_dir, "story_clips")
         ),
         skip_download=args.skip_download,
+        job_status=args.job_status,
+        clip_status=args.clip_status,
+        approve=args.approve,
+        reject=args.reject,
+        needs_changes=args.needs_changes,
+        retry_clip=args.retry_clip,
+        review_note=args.review_note,
+        approved_export=args.approved_export,
         # Voice-Over Commentary
         voiceover=args.voiceover,
         voiceover_voice=args.voiceover_voice,

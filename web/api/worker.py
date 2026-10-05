@@ -15,6 +15,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+from clipping.checkpoints import JobCheckpoint
+
 from .config_adapter import build_config_from_payload
 from .models import ClipDetail, JobStatus
 from . import store
@@ -51,6 +53,9 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
         cfg = build_config_from_payload(
             payload, job_id, env_overrides=_settings_env
         )
+        checkpoint = JobCheckpoint.from_cfg(cfg)
+        from clipping import broll_policy
+        broll_policy.reset_broll_session(cfg.outputs_dir)
 
         # Validate API key
         if not cfg.api_key_gemini:
@@ -61,6 +66,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
             return
 
         # --- Step 1: Download ---
+        checkpoint.mark_started("download", artifact_path=cfg.file_video_asli)
         store.set_status(job_id, JobStatus.DOWNLOADING)
         store.update_progress(
             job_id,
@@ -114,6 +120,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                     getattr(cfg, "download_source_height", "max"),
                     source_platform=source_platform,
                 )
+                checkpoint.mark_succeeded("download", artifact_path=cfg.file_video_asli)
                 store.update_progress(
                     job_id,
                     step="download",
@@ -124,6 +131,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                 )
 
         # --- Step 2: Transcribe ---
+        checkpoint.mark_started("transcribe")
         store.set_status(job_id, JobStatus.TRANSCRIBING)
         store.update_progress(
             job_id,
@@ -155,6 +163,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                 compute_type=cfg.whisper_compute_type,
             )
 
+        checkpoint.mark_succeeded("transcribe", transcript_chars=len(transkrip_lengkap))
         store.update_progress(
             job_id,
             step="transcribe",
@@ -165,6 +174,10 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
         )
 
         # --- Step 3: AI Analysis ---
+        import json
+
+        gemini_output_path = os.path.join(cfg.outputs_dir, "gemini_response.json")
+        checkpoint.mark_started("analyze", gemini_path=gemini_output_path)
         store.set_status(job_id, JobStatus.ANALYZING)
         store.update_progress(
             job_id,
@@ -175,10 +188,6 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
             percent=36.0,
         )
 
-        import json
-
-        gemini_output_path = os.path.join(cfg.outputs_dir, "gemini_response.json")
-
         if getattr(cfg, "load_gemini_json", False) and os.path.exists(gemini_output_path):
             with open(gemini_output_path, "r", encoding="utf-8") as f:
                 hasil_json = json.load(f)
@@ -187,6 +196,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
             with open(gemini_output_path, "w", encoding="utf-8") as f:
                 json.dump(hasil_json, f, indent=4, ensure_ascii=False)
 
+        checkpoint.mark_succeeded("analyze", gemini_path=gemini_output_path, clip_count=len(hasil_json))
         store.update_progress(
             job_id,
             step="analyze",
@@ -197,12 +207,14 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
         )
 
         # --- Step 4: Metadata ---
+        checkpoint.mark_started("metadata")
         from clipping import metadata
 
         hasil_json = metadata.normalize_and_validate(hasil_json)
         metadata_path = os.path.join(cfg.outputs_dir, "metadata_preview.json")
         metadata.save_metadata_preview(hasil_json, path=metadata_path)
 
+        checkpoint.mark_succeeded("metadata", preview_path=metadata_path)
         store.update_progress(
             job_id,
             step="metadata",
@@ -262,6 +274,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                 diarization_data = None
 
         # --- Step 6: Render Preparation ---
+        checkpoint.mark_started("render")
         store.set_status(job_id, JobStatus.RENDERING)
         store.update_progress(
             job_id,
@@ -330,6 +343,28 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                 render_manifest.append(hasil_render)
 
         # --- Save manifest ---
+        from clipping import export_package, final_metadata
+        for row in render_manifest:
+            metadata_path = os.path.join(
+                cfg.outputs_dir,
+                f"clip_{row.get('rank', 'unknown')}_metadata.json",
+            )
+            try:
+                final_metadata.write_metadata_sidecar(row, metadata_path)
+                row["metadata_path"] = metadata_path
+            except (OSError, TypeError, ValueError) as exc:
+                row["metadata_error"] = str(exc)
+
+        package_summary = export_package.export_publishing_package(
+            render_manifest,
+            cfg.outputs_dir,
+            source_segments=data_segmen,
+        )
+        for row in render_manifest:
+            package_id = f"clip_{int(row.get('rank', 0) or 0):02d}"
+            row["publishing_package_path"] = os.path.join(
+                cfg.outputs_dir, "publishing_package", package_id
+            )
         manifest_path = os.path.join(cfg.outputs_dir, "render_manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(render_manifest, f, ensure_ascii=False, indent=2)
@@ -353,6 +388,7 @@ def _run_pipeline_sync(job_id: str, payload: dict) -> None:
                 )
             )
 
+        checkpoint.mark_succeeded("render", manifest_path=manifest_path, clip_count=len(clips))
         store.set_clips(job_id, clips)
         store.update_progress(
             job_id,

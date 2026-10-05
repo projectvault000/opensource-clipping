@@ -18,6 +18,17 @@ import time
 from clipping.config import build_config, _make_url_slug
 
 
+def _configure_console_encoding():
+    """Avoid Windows console crashes when help/banner text contains Unicode."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def _print_banner(cfg, version, url, idx=None, total=None):
     """Print configuration banner for a single URL run."""
     _PLATFORM_LABELS = {
@@ -107,9 +118,88 @@ def _run_single_url(cfg, url, version, idx=None, total=None):
 
 
 def main():
+    _configure_console_encoding()
     cfg = build_config(sys.argv[1:])
 
     version = "1.15.0"
+
+    if getattr(cfg, "job_status", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id = str(cfg.job_status).strip()
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        print(manager.build_status_lines())
+        return
+
+    if getattr(cfg, "clip_status", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id, clip_id = cfg.clip_status
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        clip = manager.get_clip(clip_id)
+        print(f"CLIP {clip_id}\nProcessing: {clip.get('processing_status', 'PENDING')}\nQC: {clip.get('qc_status', 'NOT_RUN')}\nReview: {clip.get('review_status', 'PENDING')}\nNote: {clip.get('review_note') or '—'}\nFingerprint: {clip.get('review_fingerprint') or 'n/a'}")
+        return
+
+    if getattr(cfg, "approve", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id, clip_id = cfg.approve
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        manager.set_review_status(clip_id, "APPROVED", note=getattr(cfg, "review_note", "") or "Approved by user")
+        print(f"✅ Approved {clip_id} for job {job_id}")
+        return
+
+    if getattr(cfg, "reject", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id, clip_id = cfg.reject
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        manager.set_review_status(clip_id, "REJECTED", note=getattr(cfg, "review_note", "") or "Rejected by user")
+        print(f"⚠️ Rejected {clip_id} for job {job_id}")
+        return
+
+    if getattr(cfg, "needs_changes", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id, clip_id = cfg.needs_changes
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        manager.set_review_status(clip_id, "NEEDS_CHANGES", note=getattr(cfg, "review_note", "") or "Needs revision")
+        print(f"🔁 Marked {clip_id} as NEEDS_CHANGES for job {job_id}")
+        return
+
+    if getattr(cfg, "retry_clip", None):
+        from clipping.retry import load_retry_config
+        from clipping.review_manager import ReviewManager
+        from clipping.runner import run_pipeline
+
+        job_id, clip_id = cfg.retry_clip
+        retry_cfg, rank = load_retry_config(cfg.outputs_dir, job_id, clip_id)
+        manager = ReviewManager(retry_cfg.outputs_dir)
+        clip = manager.get_clip(clip_id)
+        if clip.get("review_status") != "NEEDS_CHANGES" or not any(
+            row.get("clip_id") == clip_id for row in manager.get_manifest()
+        ):
+            raise ValueError("Retry requires an existing clip marked NEEDS_CHANGES.")
+        if not retry_cfg.api_key_gemini and getattr(retry_cfg, "voiceover", False):
+            raise ValueError("GOOGLE_API_KEY is required to regenerate voice-over commentary.")
+        run_pipeline(retry_cfg, target_rank=rank)
+        print(f"Rerendered {clip_id} for job {job_id}; inspect and approve the new generation.")
+        return
+
+    if getattr(cfg, "approved_export", None):
+        from clipping.review_manager import ReviewManager
+
+        job_id = str(cfg.approved_export).strip()
+        job_dir = os.path.join(cfg.outputs_dir, job_id)
+        manager = ReviewManager(job_dir)
+        result = manager.export_approved_set()
+        print(f"Approved export written to {result['manifest_path']} and {result['zip_path']}")
+        return
 
     # ── Story Clip Mode ──────────────────────────────────────────────
     if getattr(cfg, "story_mode", False):

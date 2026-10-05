@@ -101,7 +101,7 @@ async def health_check() -> SystemHealthResponse:
     """System health check."""
     return SystemHealthResponse(
         status="ok",
-        version="1.12.0",
+        version="1.15.0",
         gpu_available=_check_gpu(),
         ffmpeg_available=_check_ffmpeg(),
         jobs_running=job_store.get_running_count(),

@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OpenSource Clipping Studio",
     description="AI Auto-Clipper & Teaser Generator — Web GUI API",
-    version="1.12.0",
+    version="1.15.0",
     lifespan=lifespan,
 )
 
@@ -60,7 +60,7 @@ app.include_router(settings.router)
 async def root():
     return {
         "name": "OpenSource Clipping Studio",
-        "version": "1.13.0",
+        "version": "1.15.0",
         "docs": "/docs",
         "health": "/api/health",
     }

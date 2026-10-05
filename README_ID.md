@@ -61,54 +61,9 @@
 
 ## ☁️ Menjalankan di Google Colab (Direkomendasikan)
 
-Jika Anda tidak memiliki GPU di laptop/PC, cara termudah untuk menjalankan pipeline ini adalah melalui **Google Colab**.
-Buka notebook Google Colab baru, pastikan Runtime memakai **T4 GPU**, lalu jalankan cell berikut secara berurutan:
+Buka [Quick Start Notebook](notebooks/Quick_Start.ipynb) di Google Colab, lalu pilih **Runtime > Change runtime type > GPU**. Jalankan sel secara berurutan untuk clone, install `requirements.txt`, mengambil Colab Secrets, render, review, approval, dan download ZIP yang disetujui. Jenis GPU tidak diasumsikan. Notebook mengecek CUDA sebelum Whisper `float16` dan menjelaskan opsi CPU `float32`.
 
-**Cell 1: Setup & Clone**
-```python
-!rm -rf ./* ./.*
-!git clone https://github.com/your-username/opensource-clipping.git .
-!pip install -r requirements.txt
-```
-
-**Cell 2: Setup API Keys**
-```python
-import os
-from pathlib import Path
-from google.colab import userdata
-
-# Daftarkan GOOGLE_API_KEY di menu Secrets Colab (ikon kunci)
-GOOGLE_API_KEY = userdata.get("GOOGLE_API_KEY")
-
-env_text = f"GOOGLE_API_KEY={GOOGLE_API_KEY}\n"
-Path(".env").write_text(env_text, encoding="utf-8")
-```
-
-**Cell 3: Eksekusi (Contoh termasuk fallback Kaggle untuk float32)**
-```python
-URL_YOUTUBE = "https://www.youtube.com/watch?v=Dc4_aBFAYWE&pp=0gcJCdkKAYcqIYzv"
-JUMLAH_CLIP = 10
-RASIO = "9:16"
-FONT_STYLE = "DEFAULT"
-GEMINI_MODEL = "gemini-3-flash-preview"
-# Gunakan 'float32' untuk limitasi hardware Kaggle, atau 'float16' untuk standar Colab T4
-WHISPER_COMPUTE_TYPE = "float32"
-
-!python main.py \
-  --url "{URL_YOUTUBE}" \
-  --clips {JUMLAH_CLIP} \
-  --ratio "{RASIO}" \
-  --font-style "{FONT_STYLE}" \
-  --hook-duration 3 \
-  --words-per-sub 5 \
-  --gemini-model "{GEMINI_MODEL}" \
-  --whisper-compute-type "{WHISPER_COMPUTE_TYPE}" \
-  --no-bgm
-```
-
-> 💡 **Baru pertama kali?** Gunakan **[Quick Start Notebook](notebooks/Quick_Start.ipynb)** — notebook yang ramah pemula dengan konfigurasi minimal, instruksi langkah demi langkah dalam Bahasa Inggris, dan hanya 3 pengaturan yang perlu diubah (URL YouTube, jumlah klip, dan model Whisper).
->
-> Kami juga menyertakan `notebooks/Lib_OpenSource_Clipping.ipynb` sebagai template lengkap.
+Proses render memakai `/content` yang sementara. Jika proses Python terhenti tetapi runtime masih hidup, checkpoint lokal dapat dipakai ulang. Reset runtime dapat menghapus `/content`; mount Drive opsional di notebook hanya menyalin ZIP selesai, bukan pemulihan checkpoint otomatis. `notebooks/Lib_OpenSource_Clipping.ipynb` adalah template lama, bukan alur rilis V1.
 
 ---
 
@@ -150,7 +105,7 @@ WHISPER_COMPUTE_TYPE = "float32"
 
 ```bash
 # 1. Clone repo
-git clone https://github.com/your-username/opensource-clipping.git
+git clone https://github.com/projectvault000/opensource-clipping.git
 cd opensource-clipping
 
 # 2. Install dependensi (pilih salah satu)
@@ -492,8 +447,8 @@ Contoh:
 | Flag | Perilaku | Bagian yang Terpengaruh |
 |---|---|---|
 | *(default, tanpa flag)* | AI smart-trim bagian boring/filler | Clip utama saja |
-| `--silence-trim` | AI trim lebih agresif — jeda >0.5 detik dibuang | Clip utama saja |
-| `--no-segment-trim` | Tidak ada trim, render penuh start-to-end | Clip utama saja |
+| `--silence-trim` | Minta AI memilih segmen lebih rapat; pacing konservatif tetap menjaga jeda bermakna | Clip utama saja |
+| `--no-segment-trim` | Nonaktifkan trim segmen dan jeda otomatis; render seluruh rentang sumber | Clip utama saja |
 
 > [!NOTE]
 > - **Hook V2 tidak terpengaruh** oleh ketiga opsi di atas. Hook V2 selalu mengambil potongan cepat sesuai yang AI pilih.
